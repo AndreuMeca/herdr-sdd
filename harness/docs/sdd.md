@@ -1,0 +1,155 @@
+# Spec-driven development rules
+
+The only rules file. `AGENTS.md` is the map, `harness/roles/*.md` give each agent its job, and the launcher
+(`harness/harness.py`) enforces what a script can enforce. When a role file and this file disagree, this file
+wins. Commands: `python3 harness/harness.py --help`.
+
+## 1. Lifecycle
+
+One feature = one slug = one folder `harness/features/<slug>/` = one branch = one worktree. The orchestrator
+(the agent the human talks to, on the base checkout) starts a feature and hands it to the driver: a launcher
+process that runs the roles one at a time in the feature's worktree, commits what each role wrote, sends what
+is missing back, runs the gates set to `auto`, and stops when a human is needed. One writer per checkout,
+always.
+
+A feature's state is never written anywhere: the launcher reads it from the files and refs on disk, in this
+order of evidence.
+
+| state | evidence | next |
+|---|---|---|
+| `done` | the folder is on the base checkout: the feature has no worktree on its branch | — |
+| `blocked` | `questions.md` asks something | the human answers: `drive <slug> "<answer>" --tab` |
+| `spec` | no approval yet; rules 2–4 red | spec_author |
+| `spec_ready` | no approval yet; rules 2–4 green | `approve` |
+| `implementing` | approved; rules 2–5 (without the tests) find a gap, or the review of HEAD says CHANGES_REQUESTED | implementer |
+| `review` | approved; rules 2–5 hold; no review of HEAD | base merged in, tests, then reviewer |
+| `reviewed` | approved; rules 2–5 hold; the review of HEAD says APPROVED | `merge` |
+
+A worktree whose branch is not its slug (detached, re-branched by hand) is an error `status` names, not a
+state. Approval is the ref `refs/harness/<slug>/approved`, set by `approve`. A review is "of HEAD" when the
+launcher started the round (`refs/harness/<slug>/review-start`) and no commit since then, other than a merge
+commit, touched anything but `review.md` or `questions.md`.
+
+The gates are `approve` and `merge`; `gates` in `harness/config.json` sets each to `human` (the driver stops
+and prompts the orchestrator) or `auto` (the driver runs it). Only `merge` writes to the base branch. The
+launcher blocks a feature itself, with a line in `questions.md`, at the caps: `max_review_rounds` reviews
+ending in CHANGES_REQUESTED (`harness/help/config.md`), or the same role running three times in a row within
+one driver run without the feature moving on. `approve <slug> --undo` withdraws an approval when a requirement
+must change after all: the spec may change again, `drive <slug> "<what changes>" --tab` runs the spec author,
+ticked tasks stay.
+
+## 2. Feature files
+
+| file | written by | format |
+|---|---|---|
+| `spec.md` | spec_author; frozen once approved | `# Title`, `## Intent`, `## Requirements`, `## Design`, `## Verification`, in that order. |
+| `tasks.md` | spec_author writes, implementer ticks | `# Tasks`, then `- [ ] T<n>: <text> (R1, R2)` per task, ids unique, ordered by dependency, each citing at least one R. |
+| `log.md` | implementer, append-only | `# Log`, then one `## implementer` section per run: what was done and decided, and why. |
+| `review.md` | the launcher seeds it, the reviewer fills it, one per round | `# Review`; `## Findings` (empty when seeded; the reviewer adds one line per finding with the R id and `file:line`); `## Checked` (one `- [ ]` per §5 checkpoint, seeded; the reviewer ticks what it verified). Every box ticked and nothing under `## Findings` is APPROVED; anything written there is CHANGES_REQUESTED, whatever it says; anything else decides nothing and goes back to the reviewer. |
+| `questions.md` | any role, or the launcher | `# Questions`, then one line per question the human must answer. Anything written after the heading blocks the feature until the human answers (`drive <slug> "<answer>" --tab`): the launcher clears the file and hands the questions and the answer to the role the state names next, so a role whose prompt carries the answer finds the file already cleared. |
+
+`## Design` lists the files to touch, interfaces and signatures, data flow, decisions, one discarded
+alternative and why, and what is out of scope. `## Verification` has one row per active R naming its test
+file(s) in backticks, relative paths outside `harness/`, no folder, no glob, no `..`
+(``| R1 | `tests/test_login.py::test_x` |``; anything after `::` is ignored). The launcher replaces
+`review.md` with the empty form before each review round, so a review always belongs to one round.
+
+## 3. Requirements (EARS)
+
+- One per line, `- R<n>: <text>`, ids from R1 and **stable**: never renumber; a dropped one stays as
+  `- R<n>: withdrawn`.
+- Each active R has exactly one `SHALL` and one pattern:
+  `THE SYSTEM SHALL <response>.` · `WHEN <trigger>, THE SYSTEM SHALL ...` · `WHILE <state>, THE SYSTEM SHALL ...` ·
+  `WHERE <feature is enabled>, THE SYSTEM SHALL ...` · `IF <condition>, THEN THE SYSTEM SHALL ...`
+  `THE SYSTEM` may name the component instead (`THE API SHALL`); `WHILE`,
+  `WHEN` and `WHERE` clauses may combine before it (`WHILE offline, WHEN a write arrives, THE SYSTEM SHALL ...`).
+- Observable behaviour with concrete values (`returns 404`, `within 2 s`), *what* not *how*, no soft
+  verbs (`should`, `may`, `try to`).
+- A question the intent and the code cannot answer goes to `questions.md`, not into a requirement.
+
+## 4. Traceability
+
+Every active R has a test carrying the token `<slug>:R<n>` (for example `login:R3`) anywhere in a file its
+`## Verification` row names (the test's name, its docstring, a comment); the launcher verifies this with
+`git grep` over the whole file, so the token is the contract. It is matched whole: `login:R10`,
+`user-login:R1` or `login:R1x` do not cover `login:R1`. The token proves a test for the R exists and runs
+green with the rest; whether it asserts the R is the reviewer's judgement (§5, checkpoint 1).
+
+## 5. Reviewer checkpoints
+
+Recorded one by one in `## Checked`. Before the round starts the launcher has merged the base branch in,
+verified every task ticked and every token present (rule 5) and run the tests green, so the reviewer reads tests
+rather than runs them, and judges what a script cannot. Formatting, lint and the conventions of `AGENTS.md` §1
+that a tool can check are `test_cmd`'s to enforce (`harness/help/config.md`): no checkpoint repeats a script's job.
+
+1. Every active R's test (the one carrying its token) asserts the R's behaviour: no test that only checks "does not raise", no mocking of the filesystem when a temporary directory works.
+2. No behaviour that no R describes (scope creep); no R silently reinterpreted.
+3. The diff matches the tasks; nothing undocumented.
+4. `log.md` explains the non-obvious decisions and matches the code.
+5. Error paths and edge values named in the requirements are handled.
+6. No secrets, ownerless TODOs, debug leftovers or stray files.
+
+## 6. Git and worktree rules
+
+- A role never runs a git command that writes (commit, merge, rebase, reset, push, branch, worktree, refs):
+  it edits files and stops; a commit it makes anyway is folded into the launcher's `<slug>: <role>` commit of
+  the run (rule 1).
+- The launcher merges the base branch in before every review and at `merge`. A conflict git marks in the file
+  is committed as it is, markers included, and the implementer resolves it in the files; the launcher commits
+  the resolution. A conflict git cannot mark (a binary, a file deleted on one side, a rename) aborts the merge
+  and stops the driver for the human, naming the path. At `merge`, a conflict or a failed check also clears
+  the review: what was reviewed is not what would land.
+
+## 7. What the launcher verifies
+
+| # | rule | when |
+|---|---|---|
+| 1 | a run changes only its role's files: spec_author `spec.md`, `tasks.md`, `questions.md`; implementer the project's files (not `harness/`, nor the files that steer agents, at any depth: `AGENTS.md`, `CLAUDE.md`, `.claude/`, `.codex/`, `.mcp.json`, `GEMINI.md`, `.gemini/`, `.opencode/`, `opencode.json`) plus `tasks.md`, `log.md`, `questions.md` in its folder; reviewer `review.md`, `questions.md`. The launcher commits those and restores the rest. | after every run |
+| 2 | `## Intent`, `## Requirements`, `## Design`, `## Verification` present in that order (§2), Intent and Design not empty; at least one active R, ids unique, each with exactly one `SHALL` in an EARS pattern (§3) | always |
+| 3 | every task cites an existing R, task ids unique; every active R is cited by a task | always |
+| 4 | every active R has one `## Verification` row naming a test file: a relative path outside `harness/`, no folder, no glob, no `..` | always |
+| 5 | complete: every task ticked, `log.md` exists, no conflict markers, every active R's token in a named file (§4), `test_cmd` exits 0 | before a review, at `merge` |
+| 6 | the review of HEAD decides a verdict (§2): all checkpoints ticked and nothing under `## Findings`, or something written there | after a reviewer run, at `merge` |
+
+`check [slug] [--tests|--no-tests]` prints the state and what rules 2–6 find at it (rule 5's gaps from
+`implementing` on, the tests from `review` on or with `--tests`); without a slug, every feature of the current
+checkout. A role run is done when the state moved on: spec_author to `spec_ready` or `blocked`, implementer to
+`review` or `blocked`, reviewer to `reviewed`, `implementing` or `blocked`; otherwise the driver sends what
+`check` finds back to the same role, three runs in a row at most (§1), then asks the human in `questions.md`;
+a run that leaves nothing to send back stops for the human at once. `check` in a worktree runs the branch's
+launcher and rules with the main checkout's `config.json`; what `test_cmd` runs is the branch's.
+
+## 8. Launcher semantics not in `--help`
+
+- A role run is judged from the files on disk after the launcher committed them, never from the agent's
+  state. Uncommitted changes found when the driver starts a step are a run the launcher did not finish
+  (`max_role_minutes`, a driver that died): they are committed under the role they belong to first.
+- `drive <slug> "msg"`: the message goes to the first role run, on one line (it is typed into the agent's
+  input box, whatever its size). At a gate, `auto` or not, to the role that
+  produced what is judged (spec → spec_author, merge → implementer); when blocked, to the role the state names
+  next (§2, `questions.md`). `--tab` runs the driver in the feature's workspace and returns; when it stops, it
+  prompts the pane it was started from (when an agent runs in it) with `harness: <slug> ...`. After an `auto`
+  merge, `merge` itself prompts that pane with the outcome (merged at `<sha>`, or why it failed).
+- Every role run is a fresh agent session in the role's tab of the feature's workspace, started with
+  `config.json` as it is then; the previous one is closed first. Memory between runs is the feature's files
+  and the driver's message. The launcher answers the startup dialogs its CLI is known to show (`CLIS` in
+  `harness.py`) and logs each one; when the first prompt stalls with the agent idle it sends Enter once;
+  anything else stops the driver for the human. The tab is closed once the run is judged; it stays when the
+  driver stops because of the agent (a dialog it does not know, stopped, still working, changed nothing), so
+  they can look at the screen.
+- While a driver runs a feature, `approve` and `merge` refuse it; one `merge` runs at a time.
+  `max_role_minutes`, and what to do when it stops the driver: `harness/help/config.md`.
+
+## 9. Trust model
+
+The launcher keeps cooperative agents on the lifecycle; it catches mistakes, it is not a security boundary.
+A role agent runs as you, in your worktree, with the permissions `config.json` gives it. `full` can run any
+command: move a ref, edit the main checkout, read what `copy_files` brought in (`.env`), push. `guarded` limits
+what the CLI itself allows (`doctor` names the mechanism per CLI); neither stops a determined agent, and the
+launcher does not notice a push.
+
+What holds against honest mistakes: the launcher is the only committer, commits and checks come from the main
+checkout, `merge` is local, and the orchestrator runs with the permissions you started it with. What `test_cmd`
+runs is the branch's own files, `conftest.py` and manifests included: a reviewer reads them. With both gates
+`auto`, nobody reads the spec or the code before it lands on the base branch; that is a per-project choice in
+`config.json`. The boundary, when you need one, is a disposable machine or container.
