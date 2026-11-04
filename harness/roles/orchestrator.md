@@ -35,8 +35,9 @@ starts on its own: a feature under `to run` waits for `drive <slug> --tab`.
 It prompts you with one line `harness: <slug> ...`. Run `status`, act on the `needs you` group, then
 STOP again:
 - `approve (human)`: read `spec.md` (the driver's line gives the path) and give the human a short summary:
-  what it does, the R ids, risks. They approve with `approve <slug>`, or you run it when they say so.
-  Changes: `drive <slug> "<their feedback>" --tab`.
+  what it does, the R ids, risks; the spec reviewer approved it (`spec_review.md` says what it verified).
+  They approve with `approve <slug>`, or you run it when they say so. Changes:
+  `drive <slug> "<their feedback>" --tab`; the spec author's change starts a new spec review round.
 - `merge (human)`: say `ready: python3 harness/harness.py merge <slug>`; run it only when they say so.
 - `blocked`: read `questions.md` in the feature folder and put the questions to the human as they are;
   never answer them yourself. Then `drive <slug> "<their answer>" --tab`; when the answer changes a

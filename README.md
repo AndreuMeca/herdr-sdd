@@ -11,7 +11,7 @@ CLIs in tabs, which the launcher drives through herdr's CLI. Everything harness-
 - [herdr](https://herdr.dev/docs/install/): `curl -fsSL https://herdr.dev/install.sh | sh`
 - The agent CLIs named in `harness/config.json`, logged in
 - A read of what the roles' permissions mean, `harness/help/config.md` (the whole trust model:
-  `harness/docs/sdd.md` §9)
+  `harness/docs/sdd.md` §10)
 
 ## New project
 1. GitHub's "Use this template", or `git clone <this repo> myproject && cd myproject && rm -rf .git &&
@@ -29,10 +29,10 @@ CLIs in tabs, which the launcher drives through herdr's CLI. Everything harness-
 ## Daily flow
 You, to the agent on `main`: "Build email+password login with a cookie session." It runs `start login`
 (worktree, branch, `harness/features/login/`, a herdr workspace for the worktree, and the driver, a launcher
-process with no model, in its own tab), and is free again. The driver runs the spec author, implementer and
-reviewer in their own tabs, commits what each wrote, merges `main` in and tests before every review, and
-sends what is missing back. With the shipped config (`gates` set to `human`) it stops twice, for you to read
-the spec and to merge, and prompts your agent with `harness: login ...`:
+process with no model, in its own tab), and is free again. The driver runs the spec author, spec reviewer,
+implementer and reviewer in their own tabs, commits what each wrote, merges `main` in and tests before every
+review of the code, and sends what is missing back. With the shipped config (`gates` set to `human`) it stops
+twice, for you to read the spec and to merge, and prompts your agent with `harness: login ...`:
 ```
 python3 harness/harness.py status          # needs you: spec_ready → read spec.md, then
 python3 harness/harness.py approve login   # the driver continues
@@ -42,7 +42,7 @@ python3 harness/harness.py merge login
 Type those, or tell the agent "approved" / "merge it". Feedback at a gate: `drive login "<feedback>" --tab`
 (`--tab` runs the driver in the feature's workspace and returns). Set a gate to `auto` and the driver runs
 it itself (`harness/help/config.md`, "Fully automatic"). Several features run at once, one driver each;
-`merge` is local (`harness/docs/sdd.md` §9). Each feature's state shows in herdr's sidebar once you add two
+`merge` is local (`harness/docs/sdd.md` §10). Each feature's state shows in herdr's sidebar once you add two
 lines to its config (`harness/help/config.md`).
 
 ## Layout
@@ -54,7 +54,7 @@ harness/
   config.json                  agent per role, gates, commands, files copied into worktrees
   help/config.md               every key of config.json
   docs/sdd.md                  the rules: lifecycle, file formats, EARS, traceability, what check enforces
-  roles/*.md                   job of orchestrator, spec_author, implementer, reviewer
+  roles/*.md                   job of orchestrator, spec_author, spec_reviewer, implementer, reviewer
   features/_template/          copied by start
-  features/<slug>/             spec.md, tasks.md, log.md, review.md, questions.md
+  features/<slug>/             spec.md, tasks.md, spec_review.md, log.md, review.md, questions.md
 ```

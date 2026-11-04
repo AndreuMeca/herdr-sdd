@@ -28,10 +28,11 @@ from pathlib import Path
 
 CMD = "python3 harness/harness.py"  # how every message names the launcher
 # A feature's state is never written: it is read from the files and refs on disk (docs/sdd.md §1).
-STATES = ("spec", "spec_ready", "implementing", "review", "reviewed", "blocked", "done")
-ROLES = {"spec_author": "spec", "implementer": "impl", "reviewer": "rev"}
+STATES = ("spec", "spec_review", "spec_ready", "implementing", "review", "reviewed", "blocked", "done")
+ROLES = {"spec_author": "spec", "spec_reviewer": "srev", "implementer": "impl", "reviewer": "rev"}
 DONE_WHEN = {  # the states a role run must leave the feature in
-    "spec_author": ("spec_ready", "blocked"),
+    "spec_author": ("spec_review", "blocked"),
+    "spec_reviewer": ("spec_ready", "spec", "blocked"),
     "implementer": ("review", "blocked"),
     "reviewer": ("reviewed", "implementing", "blocked"),
 }
@@ -51,6 +52,7 @@ PROTECTED = (
 )
 WRITE_SET = {  # what the launcher commits after a role run, one tuple of pathspecs per `git add`; {dir}: the folder
     "spec_author": (("{dir}/spec.md", "{dir}/tasks.md", "{dir}/questions.md"),),
+    "spec_reviewer": (("{dir}/spec_review.md", "{dir}/questions.md"),),
     "implementer": (
         (".", *(f":(exclude,glob){p}" for p in PROTECTED)),
         ("{dir}/tasks.md", "{dir}/log.md", "{dir}/questions.md"),
@@ -58,7 +60,7 @@ WRITE_SET = {  # what the launcher commits after a role run, one tuple of pathsp
     "reviewer": (("{dir}/review.md", "{dir}/questions.md"),),
 }
 SLUG_RE = re.compile(r"^[a-z][a-z0-9-]{1,19}$")  # at most 20: a herdr agent name (`impl-<slug>-<6 hex>`) is at most 32
-FEATURE_FILES = ("spec.md", "tasks.md", "review.md", "log.md", "questions.md")
+FEATURE_FILES = ("spec.md", "tasks.md", "log.md", "questions.md")  # plus the review forms (REVIEWS below)
 SPEC_SECTIONS = ("Intent", "Requirements", "Design", "Verification")  # the `## ` headings of spec.md, in this order
 # what the template itself ships: a repo with nothing tracked beyond these has no project code yet
 TEMPLATE_PATHS = ("harness/", "AGENTS.md", "README.md", "LICENSE", ".gitignore")
@@ -69,14 +71,33 @@ TASK_RE = re.compile(r"^- \[([ xX])\] (T\d+):\s*(.*)$")
 # sdd §3: WHILE/WHEN/WHERE clauses (combinable), an optional `IF ..., THEN`, then `THE <subject> SHALL <response>`
 EARS_RE = re.compile(r"^(?:(?:WHILE|WHEN|WHERE) .+?, )*(?:IF .+?, THEN )?THE \S.*? SHALL \S")
 MARKER_RE = r"^(<{7} |>{7} )"  # a conflict marker line, as `git grep -E` sees it
-RULES = Path(__file__).resolve().parent / "docs" / "sdd.md"  # the rules; §5 lists the reviewer checkpoints
+RULES = Path(__file__).resolve().parent / "docs" / "sdd.md"  # the rules; §5 and §6 list the review checkpoints
 EXIT_DONE, EXIT_ERROR, EXIT_ATTENTION = 0, 1, 2
 DRIVE_WAIT_MS = 300_000  # the driver waits for a role in slices of this length
 DEFAULT_ROLE_MINUTES = 180  # the driver stops for a human when one role run takes longer (max_role_minutes)
 FIX_TRIES = 3  # how often the driver sends a role back to its own work before stopping for the human
 REFS = "refs/harness/{slug}/"  # the launcher's marks for a feature; `merge` drops them all
 APPROVED_REF = REFS + "approved"  # set by `approve`: the spec at this commit is the approved one
-REVIEW_REF = REFS + "review-start"  # set before a reviewer round: a review belongs to HEAD while only review.md changed
+
+
+@dataclass(frozen=True)
+class Review:
+    """One of the two reviews (sdd §2), keyed in REVIEWS by the role that fills its form: how the launcher's commits
+    and questions name it, the form in the feature folder, the ref set when a round starts (the review is of HEAD
+    while only the form and questions.md changed since), and the sdd.md section whose numbered lines seed the boxes."""
+
+    name: str
+    file: str
+    ref: str
+    heading: str
+
+
+REVIEWS = {  # the review of the spec, before `approve`, and the review of the code, before `merge`
+    "spec_reviewer": Review(
+        "spec review", "spec_review.md", REFS + "spec-review-start", "5. Spec reviewer checkpoints"
+    ),
+    "reviewer": Review("review", "review.md", REFS + "review-start", "6. Reviewer checkpoints"),
+}
 # config.json speaks one vocabulary for every CLI; CLIS translates it (harness/help/config.md has the same tables)
 EFFORT_LEVELS = ("low", "medium", "high", "extra", "max")
 PERMISSION_LEVELS = ("guarded", "full")  # a role agent runs unattended: it must never stop to ask
@@ -581,13 +602,15 @@ class Markdown:
         return out if found else None
 
 
-@functools.lru_cache(maxsize=1)
-def checkpoints() -> tuple:
-    """The reviewer checkpoints of docs/sdd.md §5, numbered, in order: review.md is seeded with one box each."""
-    lines = Markdown.section(RULES.read_text(), "5. Reviewer checkpoints") or []
+@functools.cache
+def checkpoints(role: str) -> tuple:
+    """The checkpoints the role's review form is seeded with, one box each: the numbered lines of the docs/sdd.md
+    section REVIEWS names (§5 for the spec reviewer, §6 for the reviewer), in order."""
+    kind = REVIEWS[role]
+    lines = Markdown.section(RULES.read_text(), kind.heading) or []
     found = tuple(line.strip() for line in lines if re.match(r"^\d+\. ", line.strip()))
     if not found:  # a renamed heading would seed a form with no boxes, which verdict_of would read as APPROVED
-        die(f"{RULES} has no numbered line under '## 5. Reviewer checkpoints': review.md cannot be seeded")
+        die(f"{RULES} has no numbered line under '## {kind.heading}': {kind.file} cannot be seeded")
     return found
 
 
@@ -607,15 +630,19 @@ class Task:
 
 
 class FeatureFiles:
-    """The folder harness/features/<slug>/ in one checkout: what spec.md, tasks.md, review.md, log.md and
-    questions.md say, and the writes the launcher itself makes there (a question at a cap, the answer, clearing a
+    """The folder harness/features/<slug>/ in one checkout: what spec.md, tasks.md, log.md, questions.md and the
+    review forms say, and the writes the launcher itself makes there (a question at a cap, the answer, clearing a
     review), each committed."""
 
     def __init__(self, checkout: Path, slug: str):
         self.checkout, self.slug, self.git = Path(checkout), slug, Git(checkout)
         self.rel = f"harness/features/{slug}"  # as git names it
         self.dir = self.checkout / "harness" / "features" / slug
-        self.spec, self.tasks_md, self.review, self.log, self.questions_md = (self.dir / n for n in FEATURE_FILES)
+        self.spec, self.tasks_md, self.log, self.questions_md = (self.dir / n for n in FEATURE_FILES)
+
+    def form(self, role: str) -> Path:
+        """The review form the role fills (REVIEWS): spec_review.md or review.md."""
+        return self.dir / REVIEWS[role].file
 
     # --- reading
     def spec_text(self) -> str:
@@ -673,8 +700,8 @@ class FeatureFiles:
 
     @classmethod
     def review_form(cls, text: str) -> tuple[int, int, list[str]] | None:
-        """(checkpoints ticked, checkpoints listed, findings) of a review.md: its `## Checked` boxes and the lines of
-        `## Findings`. None when either section is missing: a form without them says nothing."""
+        """(checkpoints ticked, checkpoints listed, findings) of a review form: its `## Checked` boxes and the lines
+        of `## Findings`. None when either section is missing: a form without them says nothing."""
         text = Markdown.without_comments(text)
         checked, findings = Markdown.section(text, "Checked"), Markdown.section(text, "Findings")
         if checked is None or findings is None:
@@ -683,31 +710,32 @@ class FeatureFiles:
         return boxes.count("x") + boxes.count("X"), len(boxes), cls.lines(findings)
 
     @classmethod
-    def verdict_of(cls, text: str) -> str:
-        """What a review.md says, from its form alone: a finding means CHANGES_REQUESTED; every checkpoint ticked and
-        no finding means APPROVED; anything else is no verdict."""
+    def verdict_of(cls, text: str, role: str) -> str:
+        """What the role's review form says, from the form alone: a finding means CHANGES_REQUESTED; every checkpoint
+        ticked and no finding means APPROVED; anything else is no verdict."""
         form = cls.review_form(text)
         if form is None:
             return ""
         ticked, boxes, findings = form
         if findings:
             return "CHANGES_REQUESTED"
-        return "APPROVED" if ticked == len(checkpoints()) == boxes else ""
+        return "APPROVED" if ticked == len(checkpoints(role)) == boxes else ""
 
     def write_set(self, role: str) -> list[list[str]]:
         """The pathspec groups the launcher commits after a run of `role` (rule 1)."""
         return [[p.replace("{dir}", self.rel) for p in group] for group in WRITE_SET[role]]
 
     # --- history on this branch
-    def review_rounds(self, base: str) -> int:
-        """Review rounds on this branch that ended in CHANGES_REQUESTED: the reviews the launcher cleared before the
-        next round, plus the review on disk now."""
-        review = self.rel + "/review.md"
-        grep = f"^{self.slug}: clear review$"
-        clears = self.git.run("log", "--format=%H", "--grep", grep, f"{base}..HEAD", "--", review, check=False)
-        verdicts = [self.verdict_of(self.git.show(f"{sha}^", review)) for sha in clears.split()]
-        if self.review.exists():
-            verdicts.append(self.verdict_of(self.review.read_text()))
+    def review_rounds(self, role: str, base: str) -> int:
+        """Rounds of the role's review on this branch that ended in CHANGES_REQUESTED: the forms the launcher cleared
+        before the next round, plus the form on disk now."""
+        kind = REVIEWS[role]
+        path = f"{self.rel}/{kind.file}"
+        grep = f"^{self.slug}: clear {kind.name}$"
+        clears = self.git.run("log", "--format=%H", "--grep", grep, f"{base}..HEAD", "--", path, check=False)
+        verdicts = [self.verdict_of(self.git.show(f"{sha}^", path), role) for sha in clears.split()]
+        if self.form(role).exists():
+            verdicts.append(self.verdict_of(self.form(role).read_text(), role))
         return verdicts.count("CHANGES_REQUESTED")
 
     # --- the launcher's own writes, each committed
@@ -725,20 +753,21 @@ class FeatureFiles:
         self.git.commit(f"{self.slug}: questions answered", self.rel + "/questions.md")
         return asked
 
-    def clear_review(self):
-        """Remove review.md before a reviewer round (committed when tracked): a review always belongs to one round."""
-        rel = self.rel + "/review.md"
+    def clear_review(self, role: str):
+        """Remove the role's form before a round (committed when tracked): a review always belongs to one round."""
+        kind = REVIEWS[role]
+        rel = f"{self.rel}/{kind.file}"
         if self.git.tracked(rel):
             self.git.run("rm", "-q", rel)
-            self.git.run("commit", "-q", "-m", f"{self.slug}: clear review", "--", rel)
-        elif self.review.exists():
-            self.review.unlink()
+            self.git.run("commit", "-q", "-m", f"{self.slug}: clear {kind.name}", "--", rel)
+        elif self.form(role).exists():
+            self.form(role).unlink()
 
-    def seed_review(self):
-        """The review form of a new round: an empty ## Findings and one unticked box per checkpoint of sdd §5. The
-        reviewer ticks and writes findings; the form is the verdict (verdict_of)."""
-        boxes = "".join(f"- [ ] {c}\n" for c in checkpoints())
-        self.review.write_text(f"# Review\n\n## Findings\n\n## Checked\n{boxes}")
+    def seed_review(self, role: str):
+        """The role's form for a new round: an empty ## Findings and one unticked box per checkpoint (sdd §5 or §6).
+        The reviewing role ticks and writes findings; the form is the verdict (verdict_of)."""
+        boxes = "".join(f"- [ ] {c}\n" for c in checkpoints(role))
+        self.form(role).write_text(f"# Review\n\n## Findings\n\n## Checked\n{boxes}")
 
 
 @dataclass(frozen=True)
@@ -801,6 +830,7 @@ def next_action(st: str, gates: dict | None = None) -> str:
     gates = gates or {}
     return {
         "spec": "run spec_author",
+        "spec_review": "run spec_reviewer",
         "spec_ready": f"approve ({gates.get('approve', 'human')})",
         "implementing": "run implementer",
         "review": "run reviewer",
@@ -1182,7 +1212,7 @@ def agent_name(role: str, slug: str, root: Path) -> str:
 
 # ----------------------------------------------------------------------------- check
 class Checker:
-    """The state of one feature in one checkout, read from its files and refs (docs/sdd.md §1), and the rules of §7
+    """The state of one feature in one checkout, read from its files and refs (docs/sdd.md §1), and the rules of §8
     that apply to it, one method per rule (rule 2: the spec's sections, then its requirements). Rule 1 is mechanical
     (RoleRun.finish); rule 5's tests are `tests()`."""
 
@@ -1190,15 +1220,14 @@ class Checker:
         self.files, self.git = FeatureFiles(checkout, slug), Git(checkout)
         self.slug, self.base, self.checkout = slug, base, Path(checkout)
         self.approved_ref = APPROVED_REF.format(slug=slug)
-        self.review_ref = REVIEW_REF.format(slug=slug)
 
     def approved(self) -> bool:
         return self.git.ref_exists(self.approved_ref)
 
     def state(self) -> str:
         """Where the feature stands, in this order of evidence: not on its own branch (done), a question for the human
-        (blocked), no approval yet (spec / spec_ready by rules 2-4), a gap in the implementer's work (implementing,
-        rules 2-5 without the tests), a review of HEAD (reviewed / implementing by its verdict), else review."""
+        (blocked), then the stage of one review: the spec's before approval (rules 2-4, then the spec review of HEAD),
+        the code's after it (rules 2-5 without the tests, then the review of HEAD)."""
         if self.git.branch() != self.slug:
             if self.git.is_main():
                 return "done"
@@ -1211,13 +1240,16 @@ class Checker:
         if self.files.questions():
             return "blocked"
         if not self.approved():
-            return "spec" if self.spec_errors() else "spec_ready"
-        if self.spec_errors() or self.complete():
-            return "implementing"
-        verdict = self.review()[0]
-        if verdict:
-            return "reviewed" if verdict == "APPROVED" else "implementing"
-        return "review"
+            return self.stage("spec_reviewer", self.spec_errors(), "spec_review", "spec_ready", "spec")
+        return self.stage("reviewer", self.spec_errors() or self.complete(), "review", "reviewed", "implementing")
+
+    def stage(self, role: str, gaps: list, pending: str, ready: str, back: str) -> str:
+        """The state at one review's stage: a gap in what the review judges sends the feature back to the role that
+        produces it; else the review of HEAD decides (APPROVED: ready, CHANGES_REQUESTED: back); else a round is due."""
+        if gaps:
+            return back
+        verdict = self.review(role)[0]
+        return (ready if verdict == "APPROVED" else back) if verdict else pending
 
     def errors(self) -> list[str]:
         """What is wrong or missing at the feature's state: rules 2-4 always, rule 5 (without the tests) once approved,
@@ -1229,7 +1261,7 @@ class Checker:
         errs = self.spec_errors()
         if self.approved():
             errs += self.complete()
-        return errs + self.review()[1]
+        return errs + [e for role in REVIEWS for e in self.review(role)[1]]
 
     def spec_errors(self) -> list[str]:
         return self.sections() + self.requirements() + self.tasks() + self.verification()
@@ -1349,31 +1381,31 @@ class Checker:
         return [] if code == 0 else [f"tests failed (exit {code}: {cfg.test_cmd})\n{out}"]
 
     # --- rule 6
-    def review(self) -> tuple[str, list[str]]:
-        """(verdict, errors) of the review of HEAD: review.md exists, the launcher started the round, and no non-merge
-        commit since then touched anything but review.md or questions.md (otherwise the review is of older code and
-        says nothing). Its form decides the verdict (FeatureFiles.verdict_of); a form that decides nothing is the
-        error."""
-        if not self.files.review.exists() or not self.git.ref_exists(self.review_ref):
+    def review(self, role: str) -> tuple[str, list[str]]:
+        """(verdict, errors) of the role's review of HEAD: its form exists, the launcher started the round, and no
+        non-merge commit since then touched anything but the form or questions.md (otherwise the review is of an
+        older spec or code and says nothing). The form decides the verdict (FeatureFiles.verdict_of); a form that
+        decides nothing is the error."""
+        kind, form = REVIEWS[role], self.files.form(role)
+        ref = kind.ref.format(slug=self.slug)
+        if not form.exists() or not self.git.ref_exists(ref):
             return "", []
-        touched = self.git.paths(
-            "log", "--format=", "--name-only", "--no-merges", f"{self.review_ref}..HEAD", f"^{self.base}"
-        )
-        if touched - {self.files.rel + "/review.md", self.files.rel + "/questions.md"}:
+        touched = self.git.paths("log", "--format=", "--name-only", "--no-merges", f"{ref}..HEAD", f"^{self.base}")
+        if touched - {f"{self.files.rel}/{kind.file}", f"{self.files.rel}/questions.md"}:
             return "", []
-        text = self.files.review.read_text()
-        verdict = FeatureFiles.verdict_of(text)
+        text = form.read_text()
+        verdict = FeatureFiles.verdict_of(text, role)
         if verdict:
             return verdict, []
-        form = FeatureFiles.review_form(text)
-        if form is None:
-            return "", [f"{self.slug}: review.md needs a `## Findings` and a `## Checked` section (sdd §2)"]
-        ticked, boxes, _ = form
-        n = len(checkpoints())
+        parsed = FeatureFiles.review_form(text)
+        if parsed is None:
+            return "", [f"{self.slug}: {kind.file} needs a `## Findings` and a `## Checked` section (sdd §2)"]
+        ticked, boxes, _ = parsed
+        n = len(checkpoints(role))
         if boxes != n:
-            return "", [f"{self.slug}: review.md lists {boxes} checkpoints, the form has {n}: keep the seeded boxes"]
+            return "", [f"{self.slug}: {kind.file} lists {boxes} checkpoints, the form has {n}: keep the seeded boxes"]
         return "", [
-            f"{self.slug}: review.md ticks {ticked} of the {n} checkpoints and lists no finding: "
+            f"{self.slug}: {kind.file} ticks {ticked} of the {n} checkpoints and lists no finding: "
             "tick them all (APPROVED) or write what is wrong under ## Findings (CHANGES_REQUESTED)"
         ]
 
@@ -1447,21 +1479,22 @@ class RoleRun:
 
     def outcome(self, note: str, discarded: list[str]) -> Outcome:
         """DONE when the feature's state is one the role must leave it in, whatever the agent's own state says; a
-        reviewer whose CHANGES_REQUESTED is the max_review_rounds-th blocks the feature for the human. Otherwise what
-        is missing goes back to the role (errors), and a run with nothing to send back stops for the human (note)."""
+        reviewing role whose CHANGES_REQUESTED is the max_review_rounds-th blocks the feature for the human. Otherwise
+        what is missing goes back to the role (errors); a run with nothing to send back stops for the human (note)."""
         role, slug = self.role, self.slug
         state = HERDR.state(self.name)
         st = self.checker.state()
         errs = [f"{slug}: discarded, outside the {role}'s files: {', '.join(discarded)}"] if discarded else []
         if st in DONE_WHEN[role]:
-            cap = self.cfg.max_review_rounds
-            rounds = self.files.review_rounds(self.cfg.base_branch) if role == "reviewer" else 0
-            if role == "reviewer" and st == "implementing" and cap and rounds >= cap:
-                self.files.ask(
-                    f"{rounds} review rounds ended in CHANGES_REQUESTED (max_review_rounds {cap}); the findings are in "
-                    "review.md"
-                )
-                return Outcome("NEEDS_ATTENTION", f"blocked after {rounds} review rounds", errs, state)
+            kind, cap = REVIEWS.get(role), self.cfg.max_review_rounds
+            if kind and cap and self.checker.review(role)[0] == "CHANGES_REQUESTED":
+                rounds = self.files.review_rounds(role, self.cfg.base_branch)
+                if rounds >= cap:
+                    self.files.ask(
+                        f"{rounds} {kind.name} rounds ended in CHANGES_REQUESTED (max_review_rounds {cap}); "
+                        f"the findings are in {kind.file}"
+                    )
+                    return Outcome("NEEDS_ATTENTION", f"blocked after {rounds} {kind.name} rounds", errs, state)
             return Outcome("DONE", "", errs, state)
         if state == "blocked" or note:
             return Outcome("NEEDS_ATTENTION", note, [], state)
@@ -1550,6 +1583,7 @@ class Driver:
             "done": lambda t: self.stop("is done"),
             "blocked": self.at_blocked,
             "spec": lambda t: ("spec_author", t),  # the role file says what to do; a message says what is special
+            "spec_review": lambda t: self.new_round("spec_reviewer", t),
             "spec_ready": self.at_approve_gate,
             "implementing": lambda t: ("implementer", self.with_conflicts(t)),
             "review": self.before_review,
@@ -1565,9 +1599,9 @@ class Driver:
         left = sorted({p for _, p in Git(self.wt).porcelain()})
         if not left:
             return
-        own = {self.files.rel + "/review.md", self.files.rel + "/questions.md"}
-        approved = self.checker.approved()
-        role = "reviewer" if approved and set(left) <= own else "implementer" if approved else "spec_author"
+        judge, maker = ("reviewer", "implementer") if self.checker.approved() else ("spec_reviewer", "spec_author")
+        own = {f"{self.files.rel}/{REVIEWS[judge].file}", f"{self.files.rel}/questions.md"}
+        role = judge if set(left) <= own else maker
         self.log(f"committing what an unfinished {role} run left: {', '.join(left[:8])}")
         run = RoleRun(self.cfg, self.root, self.wt, role, self.slug)
         run.start()
@@ -1631,10 +1665,15 @@ class Driver:
         if errs:
             out = "\n".join(errs)[-1500:]
             return "implementer", f"{text}\ntest_cmd fails with {self.base} merged in:\n{out}".strip()
-        self.files.clear_review()
-        self.files.seed_review()
-        Git(self.wt).set_ref(REVIEW_REF.format(slug=self.slug))
-        return "reviewer", text
+        return self.new_round("reviewer", text)
+
+    def new_round(self, role: str, text: str) -> tuple[str, str]:
+        """A round of the role's review: its form cleared and seeded, the round marked (the review is of HEAD from
+        here, sdd §1), then the role runs."""
+        self.files.clear_review(role)
+        self.files.seed_review(role)
+        Git(self.wt).set_ref(REVIEWS[role].ref.format(slug=self.slug))
+        return role, text
 
     def wait_role(self, role: str, settled: bool, note: str, started: float) -> str:
         """Wait until the role agent settles; returns its note. Past max_role_minutes since `started`, stop for the
@@ -2032,6 +2071,8 @@ def cmd_approve(a):
         die(f"{f.wt} has uncommitted changes from an unfinished run; `{CMD} drive {a.slug} --tab` commits them")
     if a.undo:  # the spec may change again: `drive <slug> "<what changes>" --tab` runs the spec author
         Git(f.wt).run("update-ref", "-d", ref)
+        # the spec was frozen while approved, so the spec review that stood at the approval stands again (sdd §1)
+        Git(f.wt).set_ref(REVIEWS["spec_reviewer"].ref.format(slug=a.slug))
         state = Checker(f.wt, a.slug, cfg.base_branch).state()
         print(f'approval of {a.slug} withdrawn ({state}); next: {CMD} drive {a.slug} "<what changes>" --tab')
         HERDR.sidebar(f.wt, state_text(state, cfg.gates))
@@ -2086,7 +2127,7 @@ def land(root: Path, wt: Path, slug: str, base: str):
     conflicted = Git(wt).merge_in(base, f"{slug}: merge {base}")
     errs = [] if conflicted else Checker.run(wt, [slug], True)
     if conflicted or errs:
-        FeatureFiles(wt, slug).clear_review()
+        FeatureFiles(wt, slug).clear_review("reviewer")
         print("\n".join(errs))
         why = f"conflicts in {', '.join(conflicted)}" if conflicted else "the check fails"
         die(f"'{base}' merged into '{slug}': {why}; not merging. Run `{CMD} drive {slug} --tab`, then merge again")

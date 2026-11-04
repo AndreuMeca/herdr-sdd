@@ -30,7 +30,8 @@ _spec = importlib.util.spec_from_file_location("harness", HERE / "harness.py")
 h = importlib.util.module_from_spec(_spec)
 sys.modules["harness"] = h  # dataclasses resolve their annotations through sys.modules
 _spec.loader.exec_module(h)
-CHECKPOINTS = len(h.checkpoints())
+CHECKPOINTS = len(h.checkpoints("reviewer"))
+SPEC_CHECKPOINTS = len(h.checkpoints("spec_reviewer"))
 
 R1 = "- R1: WHEN f is called, THE SYSTEM SHALL return 1."
 NO_TOKEN = "feat: no test named for R1 in ## Verification carries the token feat:R1 (tests/test_feat.py)"
@@ -50,15 +51,17 @@ src/m.py
 |---|---|
 {rows}
 """
-AGENTS = {r: {"harness": "claude", "permissions": "full"} for r in ("spec_author", "implementer", "reviewer")}
+AGENTS = {r: {"harness": "claude", "permissions": "full"} for r in h.ROLES}
 APPROVED, REVIEW_START = "refs/harness/feat/approved", "refs/harness/feat/review-start"
+SPEC_REVIEW_START = "refs/harness/feat/spec-review-start"
 
 
-def review_text(ticked=CHECKPOINTS, findings="") -> str:
-    """review.md as a reviewer leaves it: `ticked` of the sdd §5 checkpoints `[x]`, the rest `[ ]`, and whatever it
-    wrote under ## Findings (nothing = APPROVED when every box is ticked; anything = CHANGES_REQUESTED)."""
-    boxes = "".join(f"- [{'x' if i < ticked else ' '}] {i + 1}\n" for i in range(CHECKPOINTS))
-    return f"# Review\n\n## Findings\n{findings}\n\n## Checked\n{boxes}"
+def review_text(ticked=CHECKPOINTS, findings="", boxes=CHECKPOINTS) -> str:
+    """A review form as a reviewing role leaves it: `ticked` of its `boxes` checkpoints (sdd §5 or §6) `[x]`, the
+    rest `[ ]`, and whatever it wrote under ## Findings (nothing = APPROVED when every box is ticked; anything =
+    CHANGES_REQUESTED)."""
+    lines = "".join(f"- [{'x' if i < ticked else ' '}] {i + 1}\n" for i in range(boxes))
+    return f"# Review\n\n## Findings\n{findings}\n\n## Checked\n{lines}"
 
 
 class Repo:
@@ -126,25 +129,35 @@ class Repo:
             test = "# feat:R1\ndef test_f():\n    from src.m import f\n    assert f() == 1\n"
             (self.wt / "tests" / "test_feat.py").write_text(test)
 
-    def review(self, verdict, ticked=CHECKPOINTS, findings=None):
-        """review.md as a reviewer writes it (review_text): a finding when the verdict is CHANGES_REQUESTED, nothing
-        when APPROVED (the form is the verdict)."""
+    def review(self, verdict, ticked=None, findings=None, role="reviewer"):
+        """The role's review form as it writes it (review_text): a finding when the verdict is CHANGES_REQUESTED,
+        nothing when APPROVED (the form is the verdict); `ticked` boxes, all by default."""
+        boxes = len(h.checkpoints(role))
         if findings is None:
             findings = "" if verdict == "APPROVED" else "- R1: the error path is not tested (src/m.py:1)"
-        (self.fdir / "review.md").write_text(review_text(ticked, findings))
+        (self.fdir / h.REVIEWS[role].file).write_text(review_text(boxes if ticked is None else ticked, findings, boxes))
 
     # --- the launcher's marks
     def approve(self):
         self.git("update-ref", APPROVED, "HEAD", cwd=self.wt)
 
-    def ref(self, rev="HEAD"):
-        self.git("update-ref", REVIEW_START, rev, cwd=self.wt)
+    def ref(self, rev="HEAD", role="reviewer"):
+        self.git("update-ref", h.REVIEWS[role].ref.format(slug="feat"), rev, cwd=self.wt)
 
     # --- scenarios, as the launcher would have committed them
-    def spec_ready(self):
+    def spec_review_ready(self):
         self.spec()
         self.tasks()
         self.commit("feat: spec_author", cwd=self.wt)
+
+    def spec_reviewed(self, verdict="APPROVED", **kw):
+        self.spec_review_ready()
+        self.ref(role="spec_reviewer")
+        self.review(verdict, role="spec_reviewer", **kw)
+        self.commit("feat: spec_reviewer", cwd=self.wt)
+
+    def spec_ready(self):
+        self.spec_reviewed("APPROVED")
 
     def approved(self):
         self.spec_ready()
@@ -389,7 +402,9 @@ class PureFunctions(unittest.TestCase):
         self.assertEqual(h.Markdown.section(h.Markdown.without_comments(text), "requirements"), ["", "- R1: SHALL x"])
 
     def test_verdict_from_the_form(self):
-        verdict = h.FeatureFiles.verdict_of
+        def verdict(text):
+            return h.FeatureFiles.verdict_of(text, "reviewer")
+
         self.assertEqual(verdict(review_text(CHECKPOINTS, "")), "APPROVED", "nothing written")
         self.assertEqual(verdict(review_text(CHECKPOINTS, "\n  \n")), "APPROVED", "blank lines are nothing")
         self.assertEqual(verdict(review_text(CHECKPOINTS, "<!-- a comment -->")), "APPROVED")
@@ -411,6 +426,7 @@ class PureFunctions(unittest.TestCase):
     def test_next_action_and_groups(self):
         gates = {"approve": "human", "merge": "auto"}
         self.assertEqual(h.next_action("spec", gates), "run spec_author")
+        self.assertEqual(h.next_action("spec_review", gates), "run spec_reviewer")
         self.assertEqual(h.next_action("spec_ready", gates), "approve (human)")
         self.assertEqual(h.next_action("implementing", gates), "run implementer")
         self.assertEqual(h.next_action("review", gates), "run reviewer")
@@ -424,6 +440,7 @@ class PureFunctions(unittest.TestCase):
     def test_state_text(self):
         gates = {"approve": "human", "merge": "auto"}
         self.assertEqual(h.state_text("spec_ready", gates), "spec ready · needs you: approve")
+        self.assertEqual(h.state_text("spec_review", gates), "spec review · spec_reviewer next")
         self.assertEqual(h.state_text("reviewed", gates), "reviewed · auto-merge")
         self.assertEqual(h.state_text("implementing", gates), "implementing · implementer next")
         self.assertEqual(h.state_text("implementing", gates, running="implementer"), "implementer · working")
@@ -673,26 +690,33 @@ class GitHelpers(Case):
 
     def test_review_rounds_count_changes_requested_rounds_not_commits(self):
         files = h.FeatureFiles(self.r.wt, "feat")
-        self.assertEqual(files.review_rounds("main"), 0)
+        self.assertEqual(files.review_rounds("reviewer", "main"), 0)
         self.r.review("CHANGES_REQUESTED")
         self.r.commit("feat: reviewer", cwd=self.r.wt)
         (self.r.fdir / "review.md").write_text((self.r.fdir / "review.md").read_text() + "- one more finding\n")
         self.r.commit("feat: reviewer, one more finding", cwd=self.r.wt)
-        self.assertEqual(files.review_rounds("main"), 1, "two commits in one round are one round")
-        files.clear_review()
-        self.assertEqual(files.review_rounds("main"), 1, "a cleared round still counts")
+        self.assertEqual(files.review_rounds("reviewer", "main"), 1, "two commits in one round are one round")
+        files.clear_review("reviewer")
+        self.assertEqual(files.review_rounds("reviewer", "main"), 1, "a cleared round still counts")
         self.assertEqual(self.r.log()[-1], "feat: clear review")
         self.r.review("APPROVED")
         self.r.commit("feat: reviewer", cwd=self.r.wt)
-        files.clear_review()
-        self.assertEqual(files.review_rounds("main"), 1, "an APPROVED round does not count")
+        files.clear_review("reviewer")
+        self.assertEqual(files.review_rounds("reviewer", "main"), 1, "an APPROVED round does not count")
         self.r.review("CHANGES_REQUESTED")
         self.r.commit("feat: reviewer", cwd=self.r.wt)
-        self.assertEqual(files.review_rounds("main"), 2, "the review on disk counts too")
-        files.clear_review()
+        self.assertEqual(files.review_rounds("reviewer", "main"), 2, "the review on disk counts too")
+        files.clear_review("reviewer")
         self.assertFalse((self.r.fdir / "review.md").exists())
-        files.clear_review()  # nothing to clear: no error, no commit
+        files.clear_review("reviewer")  # nothing to clear: no error, no commit
         self.assertEqual(self.r.log()[-1], "feat: clear review")
+        self.r.review("CHANGES_REQUESTED", role="spec_reviewer")
+        self.r.commit("feat: spec_reviewer", cwd=self.r.wt)
+        self.assertEqual(files.review_rounds("spec_reviewer", "main"), 1, "each review counts its own rounds")
+        self.assertEqual(files.review_rounds("reviewer", "main"), 2)
+        files.clear_review("spec_reviewer")
+        self.assertEqual(self.r.log()[-1], "feat: clear spec review")
+        self.assertEqual(files.review_rounds("spec_reviewer", "main"), 1, "a cleared spec round still counts")
 
     def test_ask_and_answer(self):
         files = h.FeatureFiles(self.r.wt, "feat")
@@ -781,13 +805,16 @@ class CheckRules(Case):
         self.assertEqual(self.r.check(), [], "an extra section is tolerated")
 
     def test_checkpoints_come_from_the_rules(self):
-        self.assertTrue(CHECKPOINTS)
-        for i, text in enumerate(h.checkpoints(), 1):
-            self.assertTrue(text.startswith(f"{i}. "), text)
+        self.assertTrue(CHECKPOINTS and SPEC_CHECKPOINTS)
         ff = h.FeatureFiles(self.r.wt, "feat")
-        ff.seed_review()
-        self.assertEqual(h.FeatureFiles.review_form(ff.review.read_text()), (0, CHECKPOINTS, []))
-        self.assertEqual(h.FeatureFiles.verdict_of(ff.review.read_text().replace("- [ ]", "- [x]")), "APPROVED")
+        for role in h.REVIEWS:
+            for i, text in enumerate(h.checkpoints(role), 1):
+                self.assertTrue(text.startswith(f"{i}. "), text)
+            ff.seed_review(role)
+            text = ff.form(role).read_text()
+            self.assertEqual(h.FeatureFiles.review_form(text), (0, len(h.checkpoints(role)), []))
+            self.assertEqual(h.FeatureFiles.verdict_of(text.replace("- [ ]", "- [x]"), role), "APPROVED")
+        self.assertEqual(ff.form("spec_reviewer").name, "spec_review.md")
 
     def test_rule_2(self):
         reqs = "- R1: WHEN x, THE SYSTEM SHALL y.\n- R1: WHEN x, THE SYSTEM SHALL z.\n- R2: returns 1."
@@ -848,7 +875,7 @@ class CheckRules(Case):
         rows = h.FeatureFiles(self.r.wt, "feat").verification()
         self.assertEqual(rows, ({"R1": ["tests/test_a.py", "tests/test_feat.py"]}, []))
         self.assertEqual(self.r.check(), [], "the files need not exist before the implementer runs")
-        self.assertEqual(self.r.state(), "spec_ready")
+        self.assertEqual(self.r.state(), "spec_review")
         for path in ("tests/", "tests/*.py", "harness/features/feat/spec.md", "harness/x.py"):
             self.r.spec(rows=f"| R1 | `{path}` |")
             self.assertEqual(
@@ -860,11 +887,16 @@ class CheckRules(Case):
     def test_states_follow_the_evidence(self):
         self.r.spec()
         self.r.tasks()
-        self.assertEqual(self.r.state(), "spec_ready")
+        self.assertEqual(self.r.state(), "spec_review")
         self.r.questions()
         self.assertEqual(self.r.state(), "blocked", "a question for the human comes first")
         self.r.questions("")
         self.r.commit("feat: spec_author", cwd=self.r.wt)
+        self.r.review("APPROVED", role="spec_reviewer")
+        self.assertEqual(self.r.state(), "spec_review", "a spec review the launcher never started says nothing")
+        self.r.ref(role="spec_reviewer")
+        self.assertEqual(self.r.state(), "spec_ready")
+        self.r.commit("feat: spec_reviewer", cwd=self.r.wt)
         self.r.approve()
         self.assertEqual(self.r.state(), "implementing")
         self.assertIn("feat: T1 is not ticked", self.r.check())
@@ -900,13 +932,16 @@ class CheckRules(Case):
 
     def test_the_checkpoints_must_exist(self):
         rules = self.r.tmp / "sdd.md"
-        rules.write_text("# Rules\n\n## 5. Reviewer checkpoints\n\nprose only\n")
+        rules.write_text(
+            "# Rules\n\n## 5. Spec reviewer checkpoints\n\nprose only\n\n## 6. Reviewer checkpoints\n\n1. x\n"
+        )
         self.stub("RULES", rules)
         h.checkpoints.cache_clear()
         self.addCleanup(h.checkpoints.cache_clear)
+        self.assertEqual(h.checkpoints("reviewer"), ("1. x",))
         with self.assertRaises(h.Die) as cm:
-            h.checkpoints()
-        self.assertIn("no numbered line under '## 5. Reviewer checkpoints'", cm.exception.msg)
+            h.checkpoints("spec_reviewer")
+        self.assertIn("no numbered line under '## 5. Spec reviewer checkpoints': spec_review.md", cm.exception.msg)
 
     def test_rule_3_task_ids_unique(self):
         self.r.spec()
@@ -980,6 +1015,39 @@ class CheckRules(Case):
         (self.r.fdir / "review.md").write_text("# Review\n\n## Findings (2)\n- R1: wrong\n\n## Checked\n- [x] 1\n")
         self.assertEqual(self.r.state(), "review", "a decorated heading is not the section: no verdict")
         self.assertEqual(self.r.check(), ["feat: review.md needs a `## Findings` and a `## Checked` section (sdd §2)"])
+
+    def test_states_follow_the_evidence_for_the_spec_review(self):
+        self.r.spec_review_ready()
+        self.assertEqual((self.r.state(), self.r.check()), ("spec_review", []))
+        self.r.review("APPROVED", role="spec_reviewer")
+        self.assertEqual(self.r.state(), "spec_review", "a spec review the launcher never started says nothing")
+        self.r.ref(role="spec_reviewer")
+        self.assertEqual(self.r.state(), "spec_ready")
+        self.r.commit("feat: spec_reviewer", cwd=self.r.wt)
+        self.assertEqual(self.r.state(), "spec_ready", "committed: still of HEAD")
+        self.r.review("APPROVED", ticked=SPEC_CHECKPOINTS - 1, role="spec_reviewer")
+        self.assertEqual(self.r.state(), "spec_review", "an unticked box decides nothing")
+        self.assertEqual(
+            self.r.check(),
+            [
+                f"feat: spec_review.md ticks {SPEC_CHECKPOINTS - 1} of the {SPEC_CHECKPOINTS} checkpoints and lists "
+                "no finding: tick them all (APPROVED) or write what is wrong under ## Findings (CHANGES_REQUESTED)"
+            ],
+        )
+        self.r.review("CHANGES_REQUESTED", role="spec_reviewer")
+        self.assertEqual((self.r.state(), self.r.check()), ("spec", []), "a finding sends the spec back")
+        self.r.commit("feat: spec_reviewer", cwd=self.r.wt)
+        ff = h.FeatureFiles(self.r.wt, "feat")
+        ff.ask("x")
+        ff.answer()
+        self.assertEqual(self.r.state(), "spec", "the launcher's questions do not age the spec review")
+        self.r.spec(reqs="- R1: WHEN f is called, THE SYSTEM SHALL return 1 at once.")
+        self.r.commit("feat: spec_author", cwd=self.r.wt)
+        self.assertEqual(self.r.state(), "spec_review", "the spec moved on: the old review is not of HEAD")
+        self.assertEqual(self.r.check(), [], "a stale spec review is not an error")
+        self.r.tasks("- [ ] T1: test f (R9)")
+        self.assertEqual(self.r.state(), "spec", "rules 2-4 come before the spec review")
+        self.assertIn("feat: T1 cites unknown R9", self.r.check())
 
     def test_the_implementers_evidence_outranks_the_verdict(self):
         self.r.reviewed("APPROVED")
@@ -1090,7 +1158,9 @@ class RoleRuns(Case):
         (self.r.wt / "src" / "m.py").write_text("def f():\n    return 1  # polished\n")
         self.r.commit("feat: T2 by the agent, with a harness change", cwd=self.r.wt)
         self.assertEqual(run.finish(), ["harness/harness.py"])
-        self.assertEqual(self.r.log(), ["feat: new feature", "feat: spec_author", "feat: implementer"])
+        self.assertEqual(
+            self.r.log(), ["feat: new feature", "feat: spec_author", "feat: spec_reviewer", "feat: implementer"]
+        )
         self.assertNotIn("hacked", (self.r.wt / "harness" / "harness.py").read_text())
         self.assertIn("polished", (self.r.wt / "src" / "m.py").read_text())
         self.assertEqual(self.r.state(), "review")
@@ -1151,6 +1221,21 @@ class RoleRuns(Case):
         self.r.questions()
         self.assertEqual(outcome("spec_author").result, "DONE", "a question is a way to finish")
         self.r.questions("")
+        out = outcome("spec_reviewer")
+        self.assertEqual(
+            (out.result, out.errors, out.note),
+            ("NEEDS_ATTENTION", [], "left the feature at 'spec_review' and changed nothing that counts"),
+        )
+        self.r.ref(role="spec_reviewer")
+        self.r.review("APPROVED", ticked=2, role="spec_reviewer")
+        out = outcome("spec_reviewer")
+        self.assertEqual(out.result, "NEEDS_ATTENTION")
+        self.assertIn("spec_review.md ticks 2 of", out.errors[0])
+        self.r.review("CHANGES_REQUESTED", role="spec_reviewer")
+        self.assertEqual(outcome("spec_reviewer").result, "DONE")
+        self.r.review("APPROVED", role="spec_reviewer")
+        self.assertEqual(outcome("spec_reviewer").result, "DONE")
+        self.r.commit("feat: spec_reviewer", cwd=self.r.wt)
         self.r.approve()
         out = outcome("implementer")
         self.assertEqual(out.result, "NEEDS_ATTENTION")
@@ -1182,6 +1267,14 @@ class RoleRuns(Case):
         self.assertIn("max_review_rounds", (self.r.fdir / "questions.md").read_text())
         self.assertEqual(self.r.git("status", "--porcelain", cwd=self.r.wt), "")
 
+    def test_outcome_spec_review_cap(self):
+        self.r.write_cfg(max_review_rounds=1)
+        self.r.spec_reviewed("CHANGES_REQUESTED")
+        out = self.run_of("spec_reviewer").outcome("", [])
+        self.assertEqual((out.result, out.note), ("NEEDS_ATTENTION", "blocked after 1 spec review rounds"))
+        self.assertEqual(self.r.state(), "blocked")
+        self.assertIn("the findings are in spec_review.md", (self.r.fdir / "questions.md").read_text())
+
     def test_what_an_agent_writes_about_state_counts_for_nothing(self):
         run = self.run_of("spec_author")
         run.start()
@@ -1189,7 +1282,13 @@ class RoleRuns(Case):
         self.r.tasks()
         text = (self.r.fdir / "spec.md").read_text()
         (self.r.fdir / "spec.md").write_text("---\nstatus: approved\n---\n" + text)
+        self.r.review("APPROVED", role="spec_reviewer")
+        self.r.ref(role="spec_reviewer")
         run.finish()
+        self.assertEqual(self.r.state(), "spec_review", "the spec review the author wrote is discarded")
+        self.r.ref(role="spec_reviewer")
+        self.r.review("APPROVED", role="spec_reviewer")
+        self.r.commit("feat: spec_reviewer", cwd=self.r.wt)
         self.assertEqual(self.r.state(), "spec_ready", "no approve ref: not approved")
         self.r.approve()
         run = self.run_of("implementer")
@@ -1208,7 +1307,7 @@ class DriverTests(Case):
         super().setUp()
         self.calls: list[tuple[str, str]] = []
         self.notes: list[str] = []
-        self.actions: dict[str, list] = {"spec_author": [], "implementer": [], "reviewer": []}
+        self.actions: dict[str, list] = {r: [] for r in h.ROLES}
         self.stub_herdr("run_role", self.fake_prompt)
         self.stub_herdr("wait", lambda name, ms: (True, ""))
         self.stub_herdr("notify", lambda pane, text: self.notes.append(text))
@@ -1235,6 +1334,9 @@ class DriverTests(Case):
     def implementer(self, with_test=True):
         self.r.implemented(with_test)
 
+    def spec_reviewer(self, verdict="APPROVED", ticked=None):
+        self.r.review(verdict, ticked=ticked, role="spec_reviewer")
+
     def reviewer(self, verdict="APPROVED", ticked=CHECKPOINTS):
         self.r.review(verdict, ticked=ticked)
 
@@ -1256,14 +1358,16 @@ class DriverTests(Case):
     def test_auto_gates_run_to_the_merge(self):
         self.auto()
         self.actions["spec_author"] = [self.spec_author]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
         self.actions["implementer"] = [self.implementer]
         self.actions["reviewer"] = [self.reviewer]
         code, out = self.drive()
         self.assertEqual(code, h.EXIT_DONE)
-        self.assertEqual(self.roles(), ["spec_author", "implementer", "reviewer"])
+        self.assertEqual(self.roles(), ["spec_author", "spec_reviewer", "implementer", "reviewer"])
         self.assertEqual(self.merged, ["feat"])
         self.assertEqual(
-            self.r.log(), ["feat: new feature", "feat: spec_author", "feat: implementer", "feat: reviewer"]
+            self.r.log(),
+            ["feat: new feature", "feat: spec_author", "feat: spec_reviewer", "feat: implementer", "feat: reviewer"],
         )
         self.assertTrue(h.Git(self.r.wt).ref_exists(APPROVED))
         self.assertEqual(self.r.state(), "reviewed")
@@ -1272,6 +1376,7 @@ class DriverTests(Case):
 
     def test_human_gate_stops_and_notifies(self):
         self.actions["spec_author"] = [self.spec_author]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
         code, out = self.drive()
         self.assertEqual(code, h.EXIT_DONE)
         self.assertEqual(len(self.notes), 1)
@@ -1286,11 +1391,12 @@ class DriverTests(Case):
         self.r.spec_ready()
         reworded = "- R1: WHEN f is called, THE SYSTEM SHALL return 1 at once."
         self.actions["spec_author"] = [lambda: self.spec_author(reqs=reworded)]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
         self.actions["implementer"] = [self.implementer]
         self.actions["reviewer"] = [self.reviewer]
         code, _ = self.drive(msg="say at once")
         self.assertEqual(code, h.EXIT_DONE)
-        self.assertEqual(self.roles(), ["spec_author", "implementer", "reviewer"])
+        self.assertEqual(self.roles(), ["spec_author", "spec_reviewer", "implementer", "reviewer"], "reviewed again")
         self.assertIn("say at once", self.calls[0][1])
         self.assertEqual(self.merged, ["feat"])
 
@@ -1319,6 +1425,7 @@ class DriverTests(Case):
 
     def test_config_is_reloaded_each_step(self):
         self.actions["spec_author"] = [lambda: (self.spec_author(), self.auto())]  # the human edits config.json
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
         self.actions["implementer"] = [self.implementer]
         self.actions["reviewer"] = [self.reviewer]
         code, _ = self.drive()
@@ -1372,32 +1479,36 @@ class DriverTests(Case):
         self.r.spec_ready()
         revised = R1 + "\n- R2: THE SYSTEM SHALL log it."
         self.actions["spec_author"] = [lambda: self.spec_author(reqs=revised, tasks="- [ ] T1: test f (R1, R2)")]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
         code, _ = self.drive(msg="please add R2")
         self.assertEqual(code, h.EXIT_DONE)
-        self.assertEqual(self.roles(), ["spec_author"])
+        self.assertEqual(self.roles(), ["spec_author", "spec_reviewer"], "the revised spec is reviewed again")
         self.assertIn("please add R2", self.calls[0][1])
+        self.assertEqual(self.r.log().count("feat: clear spec review"), 1)
         self.assertIn("spec ready, needs you", self.notes[-1], "the revised spec waits at the gate again")
 
     def test_failed_check_goes_back_then_on(self):
         self.auto()
         self.actions["spec_author"] = [self.spec_author]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
         self.actions["implementer"] = [lambda: self.implementer(with_test=False), self.implementer]
         self.actions["reviewer"] = [self.reviewer]
         code, _ = self.drive()
         self.assertEqual(code, h.EXIT_DONE)
-        self.assertEqual(self.roles(), ["spec_author", "implementer", "implementer", "reviewer"])
-        self.assertIn("no test file named for R1 in ## Verification exists", self.calls[2][1])
+        self.assertEqual(self.roles(), ["spec_author", "spec_reviewer", "implementer", "implementer", "reviewer"])
+        self.assertIn("no test file named for R1 in ## Verification exists", self.calls[3][1])
         self.assertEqual(self.merged, ["feat"])
 
     def test_red_tests_block_after_fix_tries(self):
         self.auto()
         self.r.write_cfg(gates={"approve": "auto", "merge": "auto"}, test_cmd="false")
         self.actions["spec_author"] = [self.spec_author]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
         self.actions["implementer"] = [self.implementer] * 5
         code, _ = self.drive()
         self.assertEqual(code, h.EXIT_ATTENTION)
-        self.assertEqual(self.roles(), ["spec_author"] + ["implementer"] * h.FIX_TRIES)
-        self.assertIn("test_cmd fails with main merged in", self.calls[2][1])
+        self.assertEqual(self.roles(), ["spec_author", "spec_reviewer"] + ["implementer"] * h.FIX_TRIES)
+        self.assertIn("test_cmd fails with main merged in", self.calls[3][1])
         self.assertEqual(self.r.state(), "blocked")
         self.assertIn(f"implementer ran {h.FIX_TRIES} times in a row, still at 'review'", self.notes[-1])
         self.assertIn("tests failed (exit 1: false)", (self.r.fdir / "questions.md").read_text())
@@ -1416,15 +1527,16 @@ class DriverTests(Case):
             (self.r.wt / "src" / "m.py").write_text("def f():\n    return 1\n")
 
         self.actions["spec_author"] = [self.spec_author]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
         self.actions["implementer"] = [implement_conflicting, resolve]
         self.actions["reviewer"] = [self.reviewer]
         code, _ = self.drive()
         self.assertEqual(code, h.EXIT_DONE)
-        self.assertEqual(self.roles(), ["spec_author", "implementer", "implementer", "reviewer"])
+        self.assertEqual(self.roles(), ["spec_author", "spec_reviewer", "implementer", "implementer", "reviewer"])
         conflict = "The base branch 'main' was merged in and conflicts in src/m.py: resolve them."
-        self.assertTrue(self.calls[2][1].endswith(conflict), self.calls[2][1])
+        self.assertTrue(self.calls[3][1].endswith(conflict), self.calls[3][1])
         self.assertTrue(
-            self.calls[1][1].endswith("harness/features/feat/ (base branch: main)."), "a first run: the job line"
+            self.calls[2][1].endswith("harness/features/feat/ (base branch: main)."), "a first run: the job line"
         )
         self.assertIn("feat: merge main, conflicts in src/m.py", self.r.log())
         self.assertEqual(self.merged, ["feat"])
@@ -1439,15 +1551,17 @@ class DriverTests(Case):
             (self.r.wt / "src" / "m.py").write_text("def f():\n    return 3\n")
 
         self.actions["spec_author"] = [self.spec_author]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
         self.actions["implementer"] = [implement_conflicting, lambda: None, lambda: None, lambda: None]
         code, _ = self.drive()
         self.assertEqual(code, h.EXIT_ATTENTION)
-        self.assertEqual(self.roles(), ["spec_author"] + ["implementer"] * h.FIX_TRIES)
+        self.assertEqual(self.roles(), ["spec_author", "spec_reviewer"] + ["implementer"] * h.FIX_TRIES)
         self.assertEqual(self.r.state(), "blocked")
 
     def test_another_role_resets_the_retries(self):
         self.auto()
         self.actions["spec_author"] = [self.spec_author]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
         self.actions["implementer"] = [self.implementer, self.fix, self.fix]
         self.actions["reviewer"] = [
             lambda: self.reviewer("CHANGES_REQUESTED"),
@@ -1456,13 +1570,14 @@ class DriverTests(Case):
         ]
         code, _ = self.drive()
         self.assertEqual(code, h.EXIT_DONE)
-        self.assertEqual(self.roles(), ["spec_author"] + ["implementer", "reviewer"] * 3)
+        self.assertEqual(self.roles(), ["spec_author", "spec_reviewer"] + ["implementer", "reviewer"] * 3)
         self.assertEqual(self.merged, ["feat"])
         self.assertEqual(self.r.log().count("feat: clear review"), 2)
 
     def test_changes_requested_loops_then_blocks_at_the_cap(self):
         self.auto(rounds=2)
         self.actions["spec_author"] = [self.spec_author]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
         self.actions["implementer"] = [self.implementer, self.fix]
         self.actions["reviewer"] = [
             lambda: self.reviewer("CHANGES_REQUESTED"),
@@ -1470,21 +1585,121 @@ class DriverTests(Case):
         ]
         code, _ = self.drive()
         self.assertEqual(code, h.EXIT_ATTENTION)
-        self.assertEqual(self.roles(), ["spec_author", "implementer", "reviewer", "implementer", "reviewer"])
+        self.assertEqual(
+            self.roles(), ["spec_author", "spec_reviewer", "implementer", "reviewer", "implementer", "reviewer"]
+        )
         self.assertEqual(self.r.state(), "blocked")
         self.assertIn("blocked, needs you", self.notes[-1])
+        self.assertFalse(self.merged)
+
+    def test_spec_changes_requested_loops_then_blocks_at_the_cap(self):
+        self.auto(rounds=2)
+
+        def reword():
+            self.assertIn("- R1: the error path", (self.r.fdir / "spec_review.md").read_text(), "findings on disk")
+            self.spec_author(reqs="- R1: WHEN f is called, THE SYSTEM SHALL return 1 at once.")
+
+        self.actions["spec_author"] = [self.spec_author, reword]
+        self.actions["spec_reviewer"] = [lambda: self.spec_reviewer("CHANGES_REQUESTED")] * 2
+        code, _ = self.drive()
+        self.assertEqual(code, h.EXIT_ATTENTION)
+        self.assertEqual(self.roles(), ["spec_author", "spec_reviewer", "spec_author", "spec_reviewer"])
+        self.assertEqual(self.r.state(), "blocked")
+        self.assertIn("blocked, needs you", self.notes[-1])
+        questions = (self.r.fdir / "questions.md").read_text()
+        self.assertIn("2 spec review rounds ended in CHANGES_REQUESTED (max_review_rounds 2)", questions)
+        self.assertIn("the findings are in spec_review.md", questions)
+        self.assertEqual(self.r.log().count("feat: clear spec review"), 1)
+        self.assertFalse(h.Git(self.r.wt).ref_exists(APPROVED))
         self.assertFalse(self.merged)
 
     def test_an_incomplete_review_goes_back_to_the_reviewer(self):
         self.auto()
         self.actions["spec_author"] = [self.spec_author]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
         self.actions["implementer"] = [self.implementer]
         self.actions["reviewer"] = [lambda: self.reviewer(ticked=3), self.reviewer]
         code, _ = self.drive()
         self.assertEqual(code, h.EXIT_DONE)
-        self.assertEqual(self.roles(), ["spec_author", "implementer", "reviewer", "reviewer"])
-        self.assertIn(f"ticks 3 of the {CHECKPOINTS} checkpoints", self.calls[3][1])
+        self.assertEqual(self.roles(), ["spec_author", "spec_reviewer", "implementer", "reviewer", "reviewer"])
+        self.assertIn(f"ticks 3 of the {CHECKPOINTS} checkpoints", self.calls[4][1])
         self.assertEqual(self.merged, ["feat"])
+
+    def test_an_incomplete_spec_review_goes_back_to_the_spec_reviewer(self):
+        self.auto()
+        self.actions["spec_author"] = [self.spec_author]
+        self.actions["spec_reviewer"] = [lambda: self.spec_reviewer(ticked=3), self.spec_reviewer]
+        self.actions["implementer"] = [self.implementer]
+        self.actions["reviewer"] = [self.reviewer]
+        code, _ = self.drive()
+        self.assertEqual(code, h.EXIT_DONE)
+        self.assertEqual(self.roles(), ["spec_author", "spec_reviewer", "spec_reviewer", "implementer", "reviewer"])
+        self.assertIn(f"spec_review.md ticks 3 of the {SPEC_CHECKPOINTS} checkpoints", self.calls[2][1])
+        self.assertEqual(self.merged, ["feat"])
+
+    def test_the_spec_review_form_is_seeded(self):
+        self.auto()
+        self.r.spec_review_ready()
+
+        def tick_all():
+            p = self.r.fdir / "spec_review.md"
+            text = p.read_text()
+            self.assertTrue(text.startswith("# Review\n\n## Findings\n\n## Checked\n- [ ] 1. "), text)
+            self.assertEqual(text.count("- [ ]"), SPEC_CHECKPOINTS)
+            self.assertTrue(h.Git(self.r.wt).ref_exists(SPEC_REVIEW_START), "the round is marked")
+            p.write_text(text.replace("- [ ]", "- [x]"))
+
+        self.actions["spec_reviewer"] = [tick_all]
+        self.actions["implementer"] = [self.implementer]
+        self.actions["reviewer"] = [self.reviewer]
+        code, _ = self.drive()
+        self.assertEqual((code, self.merged), (h.EXIT_DONE, ["feat"]))
+        self.assertEqual(self.roles(), ["spec_reviewer", "implementer", "reviewer"])
+        self.assertEqual(self.r.log()[1:4], ["feat: spec_author", "feat: spec_reviewer", "feat: implementer"])
+
+    def test_a_spec_reviewer_may_ask(self):
+        self.auto()
+        self.r.spec_review_ready()
+
+        def ask():
+            self.r.questions("- Is R1 meant to cover negative input?")
+
+        self.actions["spec_reviewer"] = [ask, self.spec_reviewer]
+        self.actions["implementer"] = [self.implementer]
+        self.actions["reviewer"] = [self.reviewer]
+        code, _ = self.drive()
+        self.assertEqual((code, self.r.state()), (h.EXIT_DONE, "blocked"))
+        self.assertEqual(self.r.log()[-1], "feat: spec_reviewer")
+        code, _ = self.drive(msg="no, positive only")
+        self.assertEqual(code, h.EXIT_DONE)
+        self.assertEqual(self.roles(), ["spec_reviewer", "spec_reviewer", "implementer", "reviewer"])
+        self.assertIn("Answer: no, positive only", self.calls[1][1])
+        self.assertEqual(self.merged, ["feat"])
+
+    def test_pre_approval_leftovers_go_to_their_role(self):
+        self.auto()
+        self.r.spec_review_ready()
+        self.r.ref(role="spec_reviewer")
+        self.r.review("APPROVED", role="spec_reviewer")  # uncommitted: an unfinished spec reviewer run
+        self.actions["implementer"] = [self.implementer]
+        self.actions["reviewer"] = [self.reviewer]
+        code, out = self.drive()
+        self.assertEqual(code, h.EXIT_DONE)
+        self.assertIn("committing what an unfinished spec_reviewer run left", out)
+        self.assertEqual(self.roles(), ["implementer", "reviewer"])
+        self.assertIn("feat: spec_reviewer", self.r.log())
+        self.assertEqual(self.merged, ["feat"])
+
+    def test_a_spec_authors_leftover_is_its_own(self):
+        self.r.spec()  # uncommitted, no tasks yet: an unfinished spec author run
+        self.actions["spec_author"] = [self.spec_author]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
+        code, out = self.drive()
+        self.assertEqual(code, h.EXIT_DONE)
+        self.assertIn("committing what an unfinished spec_author run left", out)
+        self.assertEqual(self.r.log()[1], "feat: spec_author")
+        self.assertEqual(self.roles(), ["spec_author", "spec_reviewer"])
+        self.assertIn("spec ready, needs you", self.notes[-1])
 
     def test_the_review_form_is_seeded(self):
         self.auto()
@@ -1569,6 +1784,7 @@ class DriverTests(Case):
     def test_an_implementer_that_breaks_tasks_md_goes_back(self):
         self.auto()
         self.actions["spec_author"] = [self.spec_author]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
         self.actions["implementer"] = [
             lambda: (self.implementer(), self.r.tasks("- [x] T1: test f (R9)")),
             self.implementer,
@@ -1576,8 +1792,8 @@ class DriverTests(Case):
         self.actions["reviewer"] = [self.reviewer]
         code, _ = self.drive()
         self.assertEqual(code, h.EXIT_DONE)
-        self.assertEqual(self.roles(), ["spec_author", "implementer", "implementer", "reviewer"])
-        self.assertIn("T1 cites unknown R9", self.calls[2][1])
+        self.assertEqual(self.roles(), ["spec_author", "spec_reviewer", "implementer", "implementer", "reviewer"])
+        self.assertIn("T1 cites unknown R9", self.calls[3][1])
         self.assertEqual(self.merged, ["feat"])
 
     def test_a_reviewers_edits_outside_review_md_are_discarded(self):
@@ -1588,6 +1804,7 @@ class DriverTests(Case):
             (self.r.wt / "src" / "m.py").write_text("# the reviewer fixed it\n")
 
         self.actions["spec_author"] = [self.spec_author]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
         self.actions["implementer"] = [self.implementer]
         self.actions["reviewer"] = [review_and_fix]
         code, out = self.drive()
@@ -1596,23 +1813,41 @@ class DriverTests(Case):
         self.assertEqual((self.r.wt / "src" / "m.py").read_text(), "def f():\n    return 1\n")
         self.assertIn("discarded, outside the reviewer's files: src/m.py", out)
 
+    def test_a_spec_reviewers_edits_outside_its_form_are_discarded(self):
+        self.auto()
+
+        def review_and_edit():
+            self.spec_reviewer()
+            self.r.spec(reqs="- R1: WHEN f is called, THE SYSTEM SHALL return 2.")
+
+        self.actions["spec_author"] = [self.spec_author]
+        self.actions["spec_reviewer"] = [review_and_edit]
+        self.actions["implementer"] = [self.implementer]
+        self.actions["reviewer"] = [self.reviewer]
+        code, out = self.drive()
+        self.assertEqual(code, h.EXIT_DONE)
+        self.assertEqual(self.merged, ["feat"])
+        self.assertIn("SHALL return 1.", (self.r.fdir / "spec.md").read_text())
+        self.assertIn("discarded, outside the spec_reviewer's files: harness/features/feat/spec.md", out)
+
     def test_a_question_blocks_and_the_answer_goes_to_the_asker(self):
         self.auto()
         self.actions["spec_author"] = [self.spec_author]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
         self.actions["implementer"] = [lambda: self.r.questions("- Is 1 right?")]
         code, _ = self.drive()
         self.assertEqual(code, h.EXIT_DONE)
         self.assertEqual(self.r.state(), "blocked")
         self.assertIn("blocked, needs you: read", self.notes[-1])
         self.assertIn("questions.md", self.notes[-1])
-        self.assertEqual(self.closed, ["spec_author", "implementer"], "a role that finished by asking is done")
+        self.assertEqual(self.closed, ["spec_author", "spec_reviewer", "implementer"], "finished by asking: done")
         self.actions["implementer"] = [self.implementer]
         self.actions["reviewer"] = [self.reviewer]
         code, _ = self.drive(msg="yes, 1")
         self.assertEqual(code, h.EXIT_DONE)
-        self.assertEqual(self.roles(), ["spec_author", "implementer", "implementer", "reviewer"])
-        self.assertIn("Is 1 right?", self.calls[2][1])
-        self.assertIn("Answer: yes, 1", self.calls[2][1])
+        self.assertEqual(self.roles(), ["spec_author", "spec_reviewer", "implementer", "implementer", "reviewer"])
+        self.assertIn("Is 1 right?", self.calls[3][1])
+        self.assertIn("Answer: yes, 1", self.calls[3][1])
         self.assertEqual(h.FeatureFiles(self.r.wt, "feat").questions(), [])
         self.assertEqual(self.merged, ["feat"])
 
@@ -1629,12 +1864,13 @@ class DriverTests(Case):
 
         def prompt(root, wt, role, slug, text, timeout_ms, acfg):
             self.fake_prompt(root, wt, role, slug, text, timeout_ms, acfg)
-            return False, ""
+            return role != "spec_author", ""  # only the spec author is stuck
 
         self.stub_herdr("wait", wait)
         self.stub_herdr("run_role", prompt)
         self.stub("time", types.SimpleNamespace(time=lambda: clock[0], sleep=lambda s: None))
         self.actions["spec_author"] = [self.spec_author]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
         return waits
 
     def test_a_role_past_max_role_minutes_stops_the_driver(self):
@@ -1648,11 +1884,14 @@ class DriverTests(Case):
     def test_the_roles_tab_goes_when_the_run_is_judged(self):
         self.auto()
         self.actions["spec_author"] = [self.spec_author]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
         self.actions["implementer"] = [lambda: self.implementer(with_test=False), self.implementer]
         self.actions["reviewer"] = [lambda: self.reviewer(ticked=2), self.reviewer]
         code, _ = self.drive()
         self.assertEqual((code, self.merged), (h.EXIT_DONE, ["feat"]))
-        self.assertEqual(self.closed, ["spec_author", "implementer", "implementer", "reviewer", "reviewer"])
+        self.assertEqual(
+            self.closed, ["spec_author", "spec_reviewer", "implementer", "implementer", "reviewer", "reviewer"]
+        )
 
     def test_no_role_limit_waits_until_the_role_settles(self):
         waits = self.stuck_role(max_minutes=0, settle_after=20)
@@ -1707,6 +1946,7 @@ class Commands(Case):
         self.assertTrue(out.startswith("harness/config.json\n"), "the setup comes first")
         self.assertIn("gates              approve: auto   merge: human", out)
         self.assertIn("implementer        codex   (default model)", out)
+        self.assertIn("spec_reviewer      claude  (default model)", out)
         self.assertIn("effort       max (codex: xhigh)", out)
         self.assertIn("permissions  guarded: never asks, the CLI blocks risky actions; its sandbox", out)
         flags = "-c model_reasoning_effort=xhigh --sandbox workspace-write --ask-for-approval never -x"
@@ -1767,7 +2007,8 @@ class Commands(Case):
             with self.assertRaises(h.Die):
                 h.start_preconditions(self.r.root, self.r.cfg(), slug)
         h.start_preconditions(self.r.root, self.r.cfg(), "a" * 20)
-        self.assertLessEqual(len(h.agent_name("spec_author", "a" * 20, self.r.root)), 32, "herdr's name limit")
+        for role in h.ROLES:
+            self.assertLessEqual(len(h.agent_name(role, "a" * 20, self.r.root)), 32, "herdr's name limit")
         a = h.parser().parse_args(["drive", "--notify", "p", "--", "feat", "--flag"])
         self.assertEqual((a.msg, a.notify, a.tab), ("--flag", "p", False), "a message may start with a dash")
         self.assertEqual(h.parser().parse_args(["drive", "feat"]).msg, "")
@@ -1864,16 +2105,18 @@ class Commands(Case):
         self.assertEqual(code, 0)
         self.assertIn("approved feat", out)
         self.assertEqual(self.r.state(), "implementing")
-        self.assertEqual(self.r.log()[-1], "feat: spec_author", "approval is a ref, not a commit")
+        self.assertEqual(self.r.log()[-1], "feat: spec_reviewer", "approval is a ref, not a commit")
         self.r.implemented()  # an implementer stopped mid-run (max_role_minutes): its files are on disk, uncommitted
         with self.assertRaises(h.Die) as cm:
             h.cmd_approve(Namespace(slug="feat", undo=True))
         self.assertIn("uncommitted changes from an unfinished run", cm.exception.msg, "undo would lose them")
         self.assertTrue(h.Git(self.r.wt).ref_exists(APPROVED))
         h.Git(self.r.wt).restore_rest()
+        self.r.implemented()
+        self.r.commit("feat: implementer", cwd=self.r.wt)  # the implementer's commits came after the spec review
         code, out = self.output(h.cmd_approve, Namespace(slug="feat", undo=True))
         self.assertEqual(code, 0)
-        self.assertIn("approval of feat withdrawn (spec_ready)", out)
+        self.assertIn("approval of feat withdrawn (spec_ready)", out, "the spec was frozen: its review stands again")
         self.assertFalse(h.Git(self.r.wt).ref_exists(APPROVED))
         with self.assertRaises(h.Die) as cm:
             h.cmd_approve(Namespace(slug="feat", undo=True))
@@ -1992,7 +2235,7 @@ class HerdrAdapter(Case):
 
     def setUp(self):
         super().setUp()
-        self.spec, self.impl, self.rev = (h.agent_name(r, "feat", self.r.root) for r in h.ROLES)
+        self.spec, self.srev, self.impl, self.rev = (h.agent_name(r, "feat", self.r.root) for r in h.ROLES)
 
     def test_each_run_starts_a_fresh_agent_in_the_roles_tab(self):
         settled, note = h.HERDR.run_role(self.r.root, self.r.wt, "implementer", "feat", "do it", 1000, agent(self.ACFG))
@@ -2330,6 +2573,7 @@ class DoctorChecks(Case):
         self.r.write_cfg(
             agents={
                 "spec_author": {"harness": "claude", "model": "", "effort": "extra", "permissions": "full"},
+                "spec_reviewer": {"harness": "claude", "model": "", "effort": "extra", "permissions": "full"},
                 "implementer": {"harness": "gemini", "model": "x/y", "permissions": "full"},
                 "reviewer": {"harness": "codex", "model": "bad", "permissions": "guarded"},
             }

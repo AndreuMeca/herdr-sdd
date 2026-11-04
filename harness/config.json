@@ -17,6 +17,12 @@
       "effort": "extra",
       "permissions": "guarded"
     },
+    "spec_reviewer": {
+      "harness": "codex",
+      "model": "",
+      "effort": "extra",
+      "permissions": "guarded"
+    },
     "implementer": {
       "harness": "claude",
       "model": "",

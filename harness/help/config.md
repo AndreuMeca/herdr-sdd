@@ -2,9 +2,9 @@
 
 The one file you edit to set the harness up for your project; this page explains every key, so that the
 README, `config.json` and this page are all you need. JSON cannot hold comments, so the explanations live
-here. The shipped `config.json` is the safe default: Claude Code writes the spec and the code, Codex reviews,
-each CLI's default model, `guarded` permissions, both gates `human` ("Fully automatic" below is the other
-end). Unknown keys such as `_help` are ignored. The launcher reads the main checkout's copy on every command,
+here. The shipped `config.json` is the safe default: Claude Code writes the spec and the code, Codex reviews
+both, each CLI's default model, `guarded` permissions, both gates `human` ("Fully automatic" below is the
+other end). Unknown keys such as `_help` are ignored. The launcher reads the main checkout's copy on every command,
 validates it and names the first problem; a feature branch cannot change what it is checked with, and a role
 run started earlier keeps the flags it was started with. `python3 harness/harness.py doctor` prints the setup
 in a few lines, then checks the tools, the config and `test_cmd` on the main checkout.
@@ -38,29 +38,29 @@ and the fix.
 | `test_cmd` | yes | shell command | The one check the launcher runs on a feature's code: the tests, and lint and format with them (next section). Exit 0 = green. |
 | `setup_cmd` | no | shell command or `""` | Run once by `start` in the new worktree, after `copy_files`: `uv sync`, `npm ci`. A worktree starts with only what git tracks, so it has no `.venv` or `node_modules` until this runs. Skipped while the repo has no project code (the first feature sets it up). When it fails, `start` says so and goes on: fix it in the worktree. |
 | `copy_files` | no | paths or globs relative to the repo root, default `[]` | Gitignored files `start` copies from the main checkout into the worktree: `[".env"]`. Tracked paths are skipped; copies, not links. Not `.venv` or `node_modules`: `setup_cmd` rebuilds them. `doctor` notes a pattern that matches nothing in the main checkout. |
-| `max_review_rounds` | no | integer, default `3`, `0` = no limit | After this many `CHANGES_REQUESTED` reviews the launcher asks the human in `questions.md` (and again after every further one). |
+| `max_review_rounds` | no | integer, default `3`, `0` = no limit | After this many `CHANGES_REQUESTED` reviews of one kind (spec or code) the launcher asks the human in `questions.md` (and again after every further one). |
 | `max_role_minutes` | no | integer, default `180`, `0` = no limit | When one role run (prompt to settled) takes longer, the driver stops and prompts the orchestrator ("still working after N min"). The agent keeps running: wait until it finishes (its screen), then `drive <slug> --tab` commits what it left and judges it; a `drive` while it still works starts a fresh agent in its place. |
 | `gates.approve`, `gates.merge` | no | `human` or `auto`; a missing key means `human` | `human`: the driver stops and prompts the orchestrator. `auto`: the driver runs the command itself. The shipped file sets both to `human`. |
-| `agents.<role>` | yes, all three | object, below | Which agent CLI and model run `spec_author`, `implementer` and `reviewer`. |
+| `agents.<role>` | yes, all four | object, below | Which agent CLI and model run `spec_author`, `spec_reviewer`, `implementer` and `reviewer`. |
 
 ## test_cmd
 
 `test_cmd` is the only check the launcher runs on a feature's code, so it decides what "green" means for your
 project.
 
-- When it runs: by the driver before every review round, with the base branch merged in; by `merge`; by
-  `check` from state `review` on (or with `--tests`); by `doctor`, on the main checkout, so that a red baseline
-  is not blamed on the first feature's implementer. Not at `start`.
+- When it runs: by the driver before every review round of the code, with the base branch merged in; by
+  `merge`; by `check` from state `review` on (or with `--tests`); by `doctor`, on the main checkout, so that a
+  red baseline is not blamed on the first feature's implementer. Not at `start`.
 - How it runs: as one shell line at the worktree root, with no terminal and stdin closed, so it must not ask
   anything. Exit 0 is green, anything else is red; the launcher keeps the last 1500 characters of its output.
 - What red does: before a review, the feature goes back to the implementer with the output; at `merge`, the
   merge is refused and the review is cleared (the feature goes through implementer, tests and reviewer again);
   `doctor` reports a problem.
-- Lint and format belong in it. The reviewer's checkpoints are judgement calls (whether a test asserts its
-  requirement, scope creep, the log, error paths, leftovers) and it is told not to check what a script can; the
-  launcher runs nothing but `test_cmd`. So what is not in this command nobody checks: add the linter, the
-  formatter in check mode, a type checker if you have one, and any other `AGENTS.md` §1 convention a tool can
-  verify.
+- Lint and format belong in it. The reviewers' checkpoints are judgement calls (whether a requirement is
+  testable, whether a test asserts it, scope creep, the log, error paths, leftovers) and they are told not to
+  check what a script can; the launcher runs nothing but `test_cmd`. So what is not in this command nobody
+  checks: add the linter, the formatter in check mode, a type checker if you have one, and any other
+  `AGENTS.md` §1 convention a tool can verify.
 - What it runs on is the branch's own files, test setup and manifests included; the command itself always comes
   from the main checkout's `config.json`.
 - Its tools must exist in the worktree: `setup_cmd` installs them there (a worktree does not share the main
@@ -68,10 +68,10 @@ project.
 
 ## `agents.<role>`
 
-Three roles, `spec_author`, `implementer` and `reviewer`, one entry each; the agent you talk to (the orchestrator)
-is not in this file: you chose its model and permissions when you started it. You never write a CLI's own flag
-for effort or permissions: the file has its own words, the launcher translates them per CLI (tables below), and
-`doctor` prints one `flags` line per role with the exact flags the CLI gets.
+Four roles, `spec_author`, `spec_reviewer`, `implementer` and `reviewer`, one entry each; the agent you talk
+to (the orchestrator) is not in this file: you chose its model and permissions when you started it. You never
+write a CLI's own flag for effort or permissions: the file has its own words, the launcher translates them per
+CLI (tables below), and `doctor` prints one `flags` line per role with the exact flags the CLI gets.
 
 | key | required | values | what it does |
 |---|---|---|---|
@@ -103,7 +103,7 @@ What that means for you: a role agent runs as your user in the worktree. `full` 
 the main checkout, read what `copy_files` brought in (`.env`), move a ref. `guarded` limits what the CLI itself
 allows. Neither stops a determined agent: the launcher is the only committer and `merge` is local, which holds
 against honest mistakes, not against an adversary. When you need a boundary, it is a disposable machine or
-container. The whole trust model: `harness/docs/sdd.md` §9.
+container. The whole trust model: `harness/docs/sdd.md` §10.
 
 A Codex `guarded` role cannot run `uv` (its cache is outside the sandbox). The launcher itself needs only
 `python3`, and it runs `test_cmd` for the reviewer; a Codex `guarded` implementer that runs a `uv` test command
@@ -129,15 +129,16 @@ Ready-to-copy entries:
 
 ## Fully automatic
 No gate stops for you: the driver approves the spec and merges by itself, and the roles never ask (a question
-a role puts in `questions.md`, or a cap, still stops the feature for you). Nobody reads the spec or the code
+a role puts in `questions.md`, or a cap, still stops the feature for you). No human reads the spec or the code
 before it lands on the base branch, and `full` roles can do anything your user can ("permissions" above). Use
 model ids your account can run (`doctor --models` tells). Replace `gates` and `agents` with:
 ```json
 "gates": { "approve": "auto", "merge": "auto" },
 "agents": {
-  "spec_author": { "harness": "claude", "model": "claude-opus-5-5",  "effort": "extra", "permissions": "full" },
-  "implementer": { "harness": "claude", "model": "claude-sonnet-5-5", "effort": "high", "permissions": "full" },
-  "reviewer":    { "harness": "codex",  "model": "gpt-6-astra",      "effort": "extra", "permissions": "guarded" }
+  "spec_author":   { "harness": "claude", "model": "claude-opus-5-5",  "effort": "extra", "permissions": "full" },
+  "spec_reviewer": { "harness": "codex",  "model": "gpt-6-astra",      "effort": "extra", "permissions": "guarded" },
+  "implementer":   { "harness": "claude", "model": "claude-sonnet-5-5", "effort": "high", "permissions": "full" },
+  "reviewer":      { "harness": "codex",  "model": "gpt-6-astra",      "effort": "extra", "permissions": "guarded" }
 }
 ```
 
