@@ -3,7 +3,8 @@
 
 Stdlib unittest, one temporary git repo (main checkout + one feature worktree) per test, no herdr: the launcher
 talks to herdr only through its HERDR adapter, whose methods the tests replace (`stub_herdr`), or a stand-in
-`herdr` binary on PATH answers. Not named test_*.py on purpose, so a project's own pytest run does not collect it.
+`herdr` or `hc` binary on PATH answers. Not named test_*.py on purpose, so a project's own pytest run does not
+collect it.
 """
 
 from __future__ import annotations
@@ -26,6 +27,8 @@ from argparse import Namespace
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+os.environ["HERDR_ENV"] = "1"  # the terminal app's adapter, wherever these tests run; HerdrAppAdapter picks the other
+os.environ.pop("HC_TERMINAL_ID", None)
 _spec = importlib.util.spec_from_file_location("harness", HERE / "harness.py")
 h = importlib.util.module_from_spec(_spec)
 sys.modules["harness"] = h  # dataclasses resolve their annotations through sys.modules
@@ -313,6 +316,98 @@ elif cmd == "pane run":
     ok({"type": "ok"})
 else:
     ok({"type": "ok"})
+"""
+
+
+# A stand-in `hc`, the same idea for the desktop app's adapter: JSON on stdout, errors as `{"error": {"kind": ...}}`.
+FAKE_HC = r"""#!/usr/bin/env python3
+import json, os, subprocess, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_HERDR_LOG"], "a") as fh:
+    fh.write(json.dumps(args) + "\n")
+state_path = os.environ["FAKE_HERDR_STATE"]
+state = json.load(open(state_path))
+terms = state.setdefault("terminals", [])
+
+
+def save():
+    json.dump(state, open(state_path, "w"))
+
+
+def ok(result):
+    print(json.dumps(result))
+    sys.exit(0)
+
+
+def err(kind, code=3):
+    print(json.dumps({"error": {"kind": kind, "message": "fake " + kind}}))
+    sys.exit(code)
+
+
+def find(ref):
+    t = next((t for t in terms if ref in (t["address"], t.get("name"))), None)
+    return t or err("not_found")
+
+
+def labels():
+    return [args[i + 1] for i, a in enumerate(args) if a == "--label"]
+
+
+def opt(flag):
+    return args[args.index(flag) + 1] if flag in args else None
+
+
+cmd = args[0]
+if cmd == "run":
+    if any(t.get("name") == opt("--name") and t["state"] == "live" for t in terms):
+        err("name_taken", 1)
+    argv = args[args.index("--") + 1:] if "--" in args else []
+    status = state.get("start_status", "idle")
+    t = {"address": "t%d" % (len(terms) + 1), "name": opt("--name"), "state": "live", "labels": labels(), "argv": argv,
+         "status": {"state": status} if argv and status != "none" else None}
+    terms.append(t)
+    save()
+    ok(t)
+elif cmd == "ls":
+    ok({"terminals": [t for t in terms if all(l in t["labels"] for l in labels())]})
+elif cmd == "get":
+    ok(find(args[1]))
+elif cmd == "kill":
+    find(args[1])["state"] = "finished"
+    save()
+    ok({})
+elif cmd == "rm":
+    state["terminals"] = [t for t in terms if t["address"] != args[1]]
+    save()
+    ok({})
+elif cmd == "read":
+    find(args[-3] if args[-2] == "--lines" else args[1])
+    print(state.get("screen", ""))
+elif cmd == "keys":
+    t = find(args[1])
+    t["status"] = {"state": "idle"}
+    state["screen"] = ""
+    save()
+    ok({})
+elif cmd == "send":
+    positional = [a for i, a in enumerate(args[1:], 1) if not a.startswith("--") and args[i - 1] != "--timeout"]
+    t = find(positional[0])
+    if (t.get("status") or {}).get("state") == "blocked":
+        err("blocked", 1)
+    if "--wait" not in args:
+        ok({"started": None})
+    ok(state.get("send_result", {"started": True, "wait": {"reason": "status", "status": "idle"}}))
+elif cmd == "wait":
+    t = find(args[1])
+    r = state.get("wait_result", {"reason": "status", "status": "idle", "exit_code": None})
+    print(json.dumps(r))
+    sys.exit(r.get("exit_code") or 0)
+elif cmd == "server":
+    if state.get("server_down"):
+        err("no_core", 1)
+    ok({"version": "fake"})
+else:
+    ok({})
 """
 
 
@@ -2593,6 +2688,256 @@ class DoctorChecks(Case):
         doc.herdr_state = lambda: None
         self.stub("probe_model", lambda *a: self.fail("probed without --models"))
         self.output(doc.run)
+
+
+class HerdrAppAdapter(Case):
+    """The desktop app's adapter against a stand-in `hc`, and a stand-in `herdr-app` for what needs the window."""
+
+    fake_herdr = True
+    ACFG = {"harness": "claude", "model": "m", "effort": "high", "permissions": "full"}
+
+    def setUp(self):
+        super().setUp()
+        bindir = self.r.tmp / "bin"
+        for name, text in (("hc", FAKE_HC), ("herdr-app", self.fake_app(0))):
+            (bindir / name).write_text(text)
+            (bindir / name).chmod(0o755)
+        self.bindir = bindir
+        self.state = {"terminals": []}
+        self.save_state()
+        self.app = h.HerdrApp()
+        self.stub("HERDR", self.app)
+        self.space = self.app.space_id(self.r.wt)
+        self.name = h.agent_name("implementer", "feat", self.r.root)
+
+    def fake_app(self, code: int) -> str:
+        return f'#!/bin/sh\necho "herdr-app $*" >> "$FAKE_HERDR_LOG.app"\nexit {code}\n'
+
+    def window(self, code: int):
+        (self.bindir / "herdr-app").write_text(self.fake_app(code))
+
+    def lines(self) -> list:
+        """What the stand-in `herdr-app` was asked."""
+        log = Path(f"{self.log_path}.app")
+        return log.read_text().splitlines() if log.exists() else []
+
+    def role(self, role="implementer", text="go", timeout=300_000):
+        return self.app.run_role(self.r.root, self.r.wt, role, "feat", text, timeout, agent(self.ACFG))
+
+    def test_runtime_is_the_innermost_one(self):
+        self.assertIs(type(h.pick_runtime({"HERDR_ENV": "1"})), h.Herdr)
+        self.assertIs(type(h.pick_runtime({"HC_TERMINAL_ID": "t1"})), h.HerdrApp)
+        self.assertIs(type(h.pick_runtime({"HERDR_ENV": "1", "HC_TERMINAL_ID": "t1"})), h.Herdr)  # TUI inside the app
+
+    def test_outside_both_runtimes_the_installed_one(self):
+        self.assertIs(type(h.pick_runtime({})), h.Herdr)  # both on PATH here
+        (self.bindir / "herdr").unlink()
+        self.setenv("PATH", str(self.bindir))
+        self.assertIs(type(h.pick_runtime({})), h.HerdrApp)
+
+    def test_a_role_runs_as_a_labelled_terminal_with_its_flags_and_the_prompt(self):
+        self.assertEqual(self.role(), (True, ""))
+        t = self.state_now()["terminals"][0]
+        self.assertEqual(t["name"], self.name)
+        self.assertEqual(t["argv"][0], "claude")
+        self.assertIn("--dangerously-skip-permissions", t["argv"])
+        self.assertIn(f"herdr.space={self.space}", t["labels"])
+        run = self.calls("run")[0]
+        for flag in ("--bg", "--no-parent", "--no-notify"):  # outlives the driver; nothing typed into the driver
+            self.assertIn(flag, run)
+        self.assertEqual(run[run.index("--cwd") + 1], str(self.r.wt))
+        self.assertTrue(self.calls("send", "--wait"))
+
+    def state_now(self) -> dict:
+        return json.loads(self.state_path.read_text())
+
+    def test_each_run_replaces_the_roles_previous_terminal(self):
+        self.role()
+        first = self.state_now()["terminals"][0]["address"]
+        self.role()
+        self.assertEqual(self.calls("kill"), [["kill", first]])
+        self.assertEqual(self.calls("rm"), [["rm", first]])
+        self.assertEqual(len(self.state_now()["terminals"]), 1)
+
+    def test_a_dialog_on_a_terminal_with_no_status_is_answered(self):
+        self.state.update(start_status="none", screen="Do you trust this folder?")
+        self.save_state()
+        self.assertEqual(self.role(), (True, ""))
+        self.assertEqual(self.calls("keys"), [["keys", self.name, "down", "enter"]])
+
+    def test_an_unknown_dialog_stops_as_blocked(self):
+        self.state.update(start_status="blocked", screen="Pick a theme")
+        self.save_state()
+        self.assertEqual(self.role(), (True, "blocked at startup"))
+        self.assertFalse(self.calls("send"))
+
+    def test_no_status_at_all_is_stopped_for_the_human(self):
+        self.state.update(start_status="none")
+        self.save_state()
+        clock = iter(range(0, 100_000, 10))
+        self.stub("time", types.SimpleNamespace(sleep=lambda s: None, time=lambda: next(clock)))
+        self.assertEqual(self.role(), (True, "? at startup"))
+
+    def test_a_turn_still_running_is_not_settled(self):
+        self.state["send_result"] = {"started": True, "wait": {"reason": "timeout", "status": "working"}}
+        self.save_state()
+        self.assertEqual(self.role(), (False, ""))
+        self.assertEqual(self.calls("send", "--wait")[0][3], "300")  # hc takes seconds
+
+    def test_a_turn_ending_blocked_is_reported(self):
+        self.state["send_result"] = {"started": True, "wait": {"reason": "status", "status": "blocked"}}
+        self.save_state()
+        self.assertEqual(self.role(), (True, "agent_blocked"))
+
+    def test_a_prompt_that_did_not_start_gets_enter_once_when_idle(self):
+        self.state["send_result"] = {"started": False}
+        self.save_state()
+        self.assertEqual(self.role(), (True, ""))
+        self.assertEqual(self.calls("keys"), [["keys", self.name, "enter"]])
+
+    def test_state_and_wait(self):
+        self.role()
+        self.assertEqual(self.app.state(self.name), "idle")
+        self.assertEqual(self.app.state("nobody"), "gone")
+        self.assertEqual(self.app.wait("nobody", 5000), (True, "not_found"))
+        self.assertEqual(self.app.wait(self.name, 5000), (True, ""))
+        self.state_set(wait_result={"reason": "timeout", "status": "working"})
+        self.assertEqual(self.app.wait(self.name, 5000), (False, ""))
+        self.state_set(wait_result={"reason": "exit", "exit_code": 1})  # hc passes on the exit code: not an error
+        self.assertEqual(self.app.wait(self.name, 5000), (True, ""))
+        self.app.call("kill", self.name)
+        self.assertEqual(self.app.state(self.name), "gone")
+
+    def state_set(self, **kw):
+        state = self.state_now()
+        state.update(kw)
+        self.state_path.write_text(json.dumps(state))
+
+    def test_screen_reads_the_visible_part_with_zero_lines(self):
+        self.role()
+        self.state_set(screen="hello")
+        self.assertIn("hello", self.app.screen(self.name, source="visible"))
+        self.assertEqual(self.calls("read")[-1][-2:], ["--lines", "0"])
+
+    def test_the_worktree_goes_where_the_apps_own_mod_puts_it(self):
+        home = self.r.tmp / "home"
+        self.setenv("HOME", str(home))
+        res = self.app.create_worktree(self.r.root, "newf", "main")
+        wt = home / ".herdr" / "worktrees" / self.r.root.name / "newf"
+        self.assertEqual(res["worktree"]["path"], str(wt))
+        self.assertEqual(res["workspace"]["workspace_id"], self.app.space_id(wt))
+        self.assertEqual(h.Git(wt).branch(), "newf")
+
+    def test_a_workspace_is_open_while_a_terminal_carries_its_label(self):
+        self.assertIsNone(self.app.workspace_of(self.r.wt))
+        self.role()
+        self.assertEqual(self.app.workspace_of(self.r.wt), self.space)
+
+    def test_removing_a_worktree_ends_its_terminals_and_leaves_the_rest_to_git(self):
+        self.role()
+        self.assertFalse(self.app.remove_worktree(self.r.wt))
+        self.assertEqual(self.state_now()["terminals"], [])
+
+    def test_the_driver_runs_in_a_shell_of_the_driver_tab(self):
+        self.state["start_status"] = "none"
+        self.save_state()
+        self.stub("subprocess", subprocess)
+        lock = h.Lock.driver(self.r.wt)
+        before_stamp = self.r.tmp / "stamp"
+        pane = self.start_driver(lock, before_stamp)
+        self.assertEqual(pane, "t1")
+        t = self.state_now()["terminals"][0]
+        self.assertEqual(t["argv"], [])  # a shell: it stays for the human once the driver stops
+        sent = self.calls("send")[0]
+        self.assertEqual(sent[1], "t1")
+        self.assertIn("drive --notify t9 -- feat", sent[2])
+        self.assertEqual(self.app.driver_tab_pane(self.space), "t1")  # the next `drive --tab` reuses it
+
+    def start_driver(self, lock, _stamp):
+        real = self.app.run_in_pane
+
+        def run_and_stamp(pane, command):
+            real(pane, command)
+            lock.write_stamp()  # what the driver does first thing
+
+        self.stub_herdr("run_in_pane", run_and_stamp)
+        return self.app.launch_driver(self.r.root, self.r.wt, "feat", "", "t9")
+
+    def test_notify_prompts_an_agent_but_never_a_shell(self):
+        self.role()
+        self.app.notify(self.name, "harness: feat is done")
+        self.assertEqual(self.calls("send")[-1], ["send", self.name, "harness: feat is done"])
+        sent = len(self.calls("send"))
+        self.app.call("run", "--name", "shell")  # no argv: a shell reports no status
+        self.app.notify("shell", "harness: feat is done")
+        self.assertEqual(len(self.calls("send")), sent)
+        self.app.notify("nobody", "harness: feat is done")  # gone: nobody to tell, no noise
+
+    def test_notify_reports_an_agent_that_refuses(self):
+        self.state.update(start_status="blocked", terminals=[])
+        self.save_state()
+        self.app.call("run", "--name", "busy", "--", "claude")
+        _, out = self.output(self.app.notify, "busy", "harness: feat is done")
+        self.assertIn("could not notify terminal busy: blocked", out)
+
+    def test_the_spaces_name_carries_the_state_while_a_window_is_open(self):
+        self.role()
+        self.app.sidebar(self.r.wt, "spec ready · needs you: approve")
+        name = f"{self.r.wt.name} · spec ready · needs you: approve"
+        self.assertEqual(self.lines()[-1], f"herdr-app do space.rename --id {self.space} --name {name}")
+
+    def test_no_window_is_no_problem(self):
+        self.window(2)
+        self.assertEqual(self.role(), (True, ""))
+        self.app.sidebar(self.r.wt, "x")
+        self.assertEqual(len([ln for ln in self.lines() if "tab.rename" in ln]), 1)  # no retry: nothing to wait for
+
+    def test_no_herdr_app_binary_is_no_problem(self):
+        (self.bindir / "herdr-app").unlink()
+        self.setenv("PATH", str(self.bindir) + ":/usr/bin:/bin")
+        self.assertEqual(self.role(), (True, ""))
+        self.app.sidebar(self.r.wt, "x")
+
+    def test_the_tab_name_waits_for_the_window_to_adopt_the_terminal(self):
+        self.window(1)
+        self.role()
+        self.assertEqual(len([ln for ln in self.lines() if "tab.rename" in ln]), 4)
+
+    def test_doctor_names_the_runtime_and_asks_for_no_sidebar_config(self):
+        _, out = self.output(h.Doctor(self.r.root, tests=False).run)
+        self.assertIn("hc in PATH (runtime: herdr app)", out)
+        self.assertIn("herdr app server reachable", out)
+        self.assertNotIn("sidebar", out)
+
+    def test_doctor_says_when_the_core_does_not_answer(self):
+        self.state["server_down"] = True
+        self.save_state()
+        doc = h.Doctor(self.r.root, tests=False)
+        _, out = self.output(doc.run)
+        self.assertIn("FAIL  herdr app server reachable (no_core", out)
+
+    def test_the_hints_name_this_runtime(self):
+        self.assertEqual(self.app.read_hint("a"), "hc read a --lines 120")
+        self.assertEqual(self.app.pane_hint("t1"), "hc read t1 --lines 40")
+        self.assertIn("git worktree add", self.app.reopen_hint(self.r.root, "b"))
+
+    def test_merge_drops_hcs_process_scope(self):
+        """`hc kill` ends every process carrying the terminal's HC_SCOPE: `merge` must outlive the terminal it ends."""
+        self.setenv("HC_SCOPE", "scope")
+        seen = {}
+
+        def popen(cmd, **kw):
+            seen.update(kw)
+            return None
+
+        self.stub("subprocess", types.SimpleNamespace(**{**vars(subprocess), "Popen": popen}))
+        driver = h.Driver.__new__(h.Driver)
+        driver.wt, driver.slug, driver.notify_pane, driver.lock = self.r.wt, "feat", "", h.Lock.driver(self.r.wt)
+        driver.log = lambda *a: None
+        with self.assertRaises(h._Stop):
+            driver.spawn_merge()
+        self.assertNotIn("HC_SCOPE", seen["env"])
+        self.assertTrue(seen["start_new_session"])
 
 
 if __name__ == "__main__":
