@@ -47,5 +47,5 @@ STOP again:
 
 ## Keep it short
 Replies are a few lines; long content lives in the feature files. Never close panes, tabs or workspaces
-you did not create; never remove worktrees. herdr beyond `harness.py`: `herdr --skill`. Leftovers or
+you did not create; never remove worktrees. herdr beyond `harness.py`: `AGENTS.md` §4. Leftovers or
 missing tools: `python3 harness/harness.py doctor`.

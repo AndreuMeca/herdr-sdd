@@ -158,6 +158,15 @@ launcher and rules with the main checkout's `config.json`; what `test_cmd` runs 
   anything else stops the driver for the human. The tab is closed once the run is judged; it stays when the
   driver stops because of the agent (a dialog it does not know, stopped, still working, changed nothing), so
   they can look at the screen.
+- herdr is two programs that share no agents, and the launcher runs on either, nothing to configure:
+  `HERDR_ENV=1` is a pane of the terminal app (`herdr`), else `HC_TERMINAL_ID` is a terminal of herdr-core, under
+  the desktop app; outside both, the one installed, the terminal app when both are. What these rules call a
+  workspace, tab or pane is a space, tab or terminal in the desktop app. There the launcher drives terminals with
+  `hc`: labels put each one in the feature's space, whether a window is open or not, without taking the human's
+  focus; the worktree goes to `~/.herdr/worktrees/<repo>/<slug>`, where the app's own worktree menu puts them; and
+  `herdr-app` only names tabs and spaces while a window is open. An agent must report its status there (OSC 7501);
+  one that does not is stopped at startup for the human. A feature is plain git, so the other program can `drive`
+  it, in a workspace of its own; a driver is one program's, and it is the lock (§1) that keeps a feature to one.
 - While a driver runs a feature, `approve` and `merge` refuse it; one `merge` runs at a time.
   `max_role_minutes`, and what to do when it stops the driver: `harness/help/config.md`.
 

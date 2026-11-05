@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""SDD harness launcher on herdr. Python 3 stdlib only. Needs git; start and drive also need herdr.
+"""SDD harness launcher on herdr. Python 3 stdlib only. Needs git; start and drive also need herdr, its terminal app or
+its desktop app (`pick_runtime`).
 
 Rules: harness/docs/sdd.md. Config: harness/config.json. Own tests: python3 harness/selftest.py.
 The driver exits 0 when it stopped at a gate or a question, 2 when an agent or a cap stopped it, 1 when it failed.
@@ -934,17 +935,38 @@ class Lock:
 
 
 class Herdr:
-    """Everything the launcher asks of herdr (https://herdr.dev), through its CLI: agents in panes, tabs, worktree
-    workspaces, the sidebar. One instance, HERDR; tests replace its methods."""
+    """Everything the launcher asks of herdr (https://herdr.dev), through the `herdr` CLI of its terminal app: agents in
+    panes, tabs, worktree workspaces, the sidebar. HerdrApp is the same contract on the desktop app. One instance,
+    HERDR (`pick_runtime`); tests replace its methods."""
 
-    @staticmethod
-    def available() -> bool:
-        return shutil.which("herdr") is not None
+    label = "herdr"  # how `doctor` names the runtime
+    binary = "herdr"
+    install = "https://herdr.dev/docs/install/"
+    dialog_states = ("blocked",)  # the agent states in which a startup dialog may be on its screen
+    startup_s = 60  # how long an agent gets to reach idle
+    sidebar_config = True  # the sidebar shows feature states only once the human's config names them
+
+    def available(self) -> bool:
+        return shutil.which(self.binary) is not None
+
+    def self_id(self) -> str:
+        """The address of the pane this process runs in, for the driver to prompt; empty outside herdr."""
+        return os.environ.get("HERDR_PANE_ID", "")
+
+    def read_hint(self, name: str) -> str:
+        """The command that shows an agent's screen to the human."""
+        return f"herdr agent read {name} --source recent-unwrapped --lines 120"
+
+    def pane_hint(self, pane: str) -> str:
+        return f"herdr pane read {pane} --lines 40"
+
+    def reopen_hint(self, root: Path, branch: str) -> str:
+        return f"herdr worktree open --cwd {root} --branch {branch}"
 
     def call(self, *args) -> dict:
         """Run a herdr CLI command; return its JSON `result`. Errors (JSON on stderr) raise HerdrError."""
         if not self.available():
-            die("herdr not found in PATH (https://herdr.dev/docs/install/)")
+            die(f"{self.binary} not found in PATH ({self.install})")
         p = subprocess.run(["herdr", *[str(a) for a in args]], text=True, capture_output=True)
         if p.returncode != 0:
             try:
@@ -1031,13 +1053,17 @@ class Herdr:
         tabs = self.call("tab", "list", "--workspace", ws_id).get("tabs", [])
         return next((t.get("tab_id") for t in tabs if t.get("label") == label), None)
 
+    def close_tab(self, tab: str):
+        """Close a tab, ending what runs in it."""
+        self.call("tab", "close", tab)
+
     def close_role_tab(self, wt: Path, role: str):
         """Close the role's tab in the worktree's workspace (ending the agent in it), if there is one. Never fatal."""
         with contextlib.suppress(HerdrError):
             ws_id = self.workspace_of(wt)
             tab = self.tab_of(ws_id, role) if ws_id else None
             if tab:
-                self.call("tab", "close", tab)
+                self.close_tab(tab)
 
     def sidebar(self, wt: Path, text: str):
         """Show the feature's state on its workspace in herdr's sidebar (Space token `$harness`, see help/config.md).
@@ -1093,20 +1119,38 @@ class Herdr:
         cli = agent.cli
         deadline = time.time() + timeout_s
         state = self.state(name)
-        while time.time() < deadline and state not in ("idle", "done"):
-            if state == "blocked":
+        while time.time() < deadline and state not in ("idle", "done", "gone"):
+            dialog = None
+            if state in self.dialog_states:
                 dialog = cli.dialog(self.screen(name, source="visible")) if cli else None
-                if not dialog:
+                if not dialog and state == "blocked":
                     return state
+            if dialog:
                 text, keys = dialog
                 print(f"{name}: answered the '{text}' dialog ({' '.join(keys)})")
-                self.call("agent", "send-keys", name, *keys)
-                with contextlib.suppress(HerdrError):  # the keys take a moment to land; `blocked` would return at once
-                    self.call("agent", "wait", name, "--until", "idle", "--until", "done", "--timeout", 10_000)
+                self.press(name, keys)
             else:
                 time.sleep(1)
             state = self.state(name)
         return state
+
+    def press(self, name: str, keys: tuple):
+        """Answer a startup dialog."""
+        self.call("agent", "send-keys", name, *keys)
+        with contextlib.suppress(HerdrError):  # the keys take a moment to land; `blocked` would return at once
+            self.call("agent", "wait", name, "--until", "idle", "--until", "done", "--timeout", 10_000)
+
+    def start_agent(self, ws_id: str, wt: Path, role: str, name: str, agent: AgentConfig):
+        """A new tab for the role, with the agent started in it."""
+        pane_id = self.new_tab(ws_id, wt, role)
+        try:
+            self.call(
+                "agent", "start", name, "--kind", agent.harness, "--pane", pane_id, "--timeout", 120_000,
+                *agent.cli_args(),
+            )  # fmt: skip
+        except HerdrError as e:
+            if e.code != "agent_not_ready":  # not ready: a startup dialog, which settle_startup answers
+                raise
 
     def run_role(
         self, root: Path, wt: Path, role: str, slug: str, text: str, timeout_ms: int, agent: AgentConfig
@@ -1118,17 +1162,15 @@ class Herdr:
         ws_id = self.open_workspace(root, wt)
         old = self.tab_of(ws_id, role)
         if old:
-            self.call("tab", "close", old)
-        pane_id = self.new_tab(ws_id, wt, role)
-        flags = agent.cli_args()
-        try:
-            self.call("agent", "start", name, "--kind", agent.harness, "--pane", pane_id, "--timeout", 120_000, *flags)
-        except HerdrError as e:
-            if e.code != "agent_not_ready":  # not ready: a startup dialog, which settle_startup answers
-                raise
-        state = self.settle_startup(name, agent)
+            self.close_tab(old)
+        self.start_agent(ws_id, wt, role, name, agent)
+        state = self.settle_startup(name, agent, self.startup_s)
         if state not in ("idle", "done"):
             return True, f"{state} at startup"
+        return self.submit(name, text, timeout_ms)
+
+    def submit(self, name: str, text: str, timeout_ms: int) -> tuple[bool, str]:
+        """Prompt a ready agent and wait for its turn, at most timeout_ms. Returns (settled, note)."""
         try:
             self.call("agent", "prompt", name, text, "--wait", "--timeout", timeout_ms)
             return True, ""
@@ -1170,7 +1212,7 @@ class Herdr:
             cmd += ["--msg-file", str(lock.msg)]
         cmd += ["--", slug]
         before = lock.stamp_value()  # every driver rewrites the stamp first thing: a start leaves a trace
-        self.call("pane", "run", pane, shlex.join(cmd))
+        self.run_in_pane(pane, shlex.join(cmd))
         for _ in range(60):  # a shell with a slow init takes a while to run the command
             if lock.stamp_value() != before:
                 return pane
@@ -1180,8 +1222,12 @@ class Herdr:
             raise HerdrError("driver_running", f"a driver (pid {pid}) is already running {slug}")
         raise HerdrError(
             "driver_not_started",
-            f"the driver did not start in pane {pane}; look at it: herdr pane read {pane} --lines 40",
+            f"the driver did not start in pane {pane}; look at it: {self.pane_hint(pane)}",
         )
+
+    def run_in_pane(self, pane: str, command: str):
+        """Type a command into the shell of a pane."""
+        self.call("pane", "run", pane, command)
 
     def resume(self, root: Path, wt: Path, slug: str) -> int:
         """After a human gate: relaunch the driver in its tab, else say what to run."""
@@ -1191,7 +1237,7 @@ class Herdr:
         try:
             ws_id = self.workspace_of(wt)
             if ws_id and self.driver_tab_pane(ws_id) and not Lock.driver(wt).running():
-                pane = self.launch_driver(root, wt, slug, "", os.environ.get("HERDR_PANE_ID", ""))
+                pane = self.launch_driver(root, wt, slug, "", self.self_id())
                 print(f"driver resumed in pane {pane}")
                 return 0
         except HerdrError as e:
@@ -1200,7 +1246,231 @@ class Herdr:
         return 0
 
 
-HERDR = Herdr()
+class HerdrApp(Herdr):
+    """The same contract on the Herdr desktop app, a separate program from the terminal app: herdr-core runs its
+    terminals, `hc` drives them, and the window shows them. What needs no window goes through `hc`, so a driver runs
+    with the window closed and never takes the human's focus: a terminal labelled `herdr.space=<id>` and
+    `herdr.tab=<id>` shows up in that space and tab, whose ids the launcher derives itself; there is no other record of
+    a workspace. A tab is its terminal; the last one closing closes the space. `herdr-app do` only names things, and
+    only while a window is open. A worktree is plain git, where the app's own `worktree` mod puts them."""
+
+    label = "herdr app"
+    binary = "hc"
+    install = "https://herdr.dev/download/"
+    dialog_states = ("blocked", "?")  # a CLI reports no status at all while its first dialog is up
+    startup_s = 120  # no `agent start` waits for it first
+    sidebar_config = False  # the space's name carries the state
+
+    def self_id(self) -> str:
+        return os.environ.get("HC_TERMINAL_ID", "")
+
+    def read_hint(self, name: str) -> str:
+        return f"hc read {name} --lines 120"
+
+    def pane_hint(self, pane: str) -> str:
+        return f"hc read {pane} --lines 40"
+
+    def reopen_hint(self, root: Path, branch: str) -> str:
+        return f"git worktree add {self.worktree_path(root, branch)} {branch}"
+
+    def call(self, *args) -> dict:
+        """Run an hc command; return its JSON (`{"raw": text}` for the commands that print text). Errors raise
+        HerdrError. hc answers JSON because its output is a pipe here; a nonzero exit alone is no error: `wait` passes
+        on the exit code of what it waited for."""
+        if not self.available():
+            die(f"{self.binary} not found in PATH ({self.install})")
+        p = subprocess.run(["hc", *[str(a) for a in args]], text=True, capture_output=True)
+        for stream in (p.stdout, p.stderr):
+            try:
+                out = json.loads(stream)
+            except ValueError:
+                continue
+            if isinstance(out, dict) and "error" in out:
+                err = out["error"]
+                raise HerdrError(err.get("kind", "error"), err.get("message", ""))
+            if isinstance(out, dict) and stream is p.stdout:
+                return out
+        if p.returncode != 0:
+            raise HerdrError("cli_error", (p.stderr or p.stdout).strip()[:500])
+        return {"raw": p.stdout}
+
+    def window(self, *args) -> int:
+        """Run an app command in the open window. Its exit code: 0 done, 1 refused, 2 no window. Never fatal."""
+        exe = shutil.which("herdr-app")
+        if not exe:
+            return 2
+        try:
+            return subprocess.run([exe, "do", *args], capture_output=True, timeout=5).returncode
+        except (OSError, subprocess.SubprocessError):
+            return 2
+
+    # --- workspaces and worktrees
+    @staticmethod
+    def app_id(prefix: str, *parts) -> str:
+        """An id for the app's labels, the same on every call: it is how the launcher finds its spaces and tabs."""
+        return prefix + hashlib.sha256("\0".join(str(p) for p in parts).encode()).hexdigest()[:32]
+
+    def space_id(self, wt: Path) -> str:
+        return self.app_id("sp", Path(wt).resolve())
+
+    def tab_labels(self, space: str, tab: str) -> list:
+        return ["--label", f"herdr.space={space}", "--label", f"herdr.tab={tab}"]
+
+    def terminals(self, *labels) -> list:
+        """The terminals with these `--label` flags, finished ones included."""
+        return self.call("ls", "--all", *labels).get("terminals", [])
+
+    def live(self, *labels) -> list:
+        return [t for t in self.terminals(*labels) if t.get("state") == "live"]
+
+    def worktree_path(self, root: Path, branch: str) -> Path:
+        return Path.home() / ".herdr" / "worktrees" / Path(root).name / branch
+
+    def workspace_of(self, wt: Path) -> str | None:
+        space = self.space_id(wt)
+        try:
+            return space if self.live("--label", f"herdr.space={space}") else None
+        except HerdrError:
+            return None
+
+    def open_workspace(self, root: Path, wt: Path) -> str:
+        return self.space_id(wt)  # the space exists once a terminal carries its label
+
+    def create_worktree(self, root: Path, slug: str, base: str) -> dict:
+        wt = self.worktree_path(root, slug)
+        Git(root).run("worktree", "add", "-q", "-b", slug, str(wt), base)
+        return {"worktree": {"path": str(wt)}, "workspace": {"workspace_id": self.space_id(wt)}}
+
+    def remove_worktree(self, wt: Path) -> bool:
+        """End the space's terminals, which closes it; False: the worktree itself is git's to remove."""
+        with contextlib.suppress(HerdrError):
+            self.end(self.terminals("--label", f"herdr.space={self.space_id(wt)}"))
+        return False
+
+    def end(self, terminals: list):
+        """End these terminals and drop their records, so a name stays free for the next run."""
+        for t in terminals:
+            if t.get("state") == "live":
+                self.call("kill", t["address"])
+            self.call("rm", t["address"])
+
+    def workspaces(self) -> list:
+        self.call("server", "status")  # what `doctor` asks of this: that the runtime answers
+        return []
+
+    def new_tab(self, ws_id: str, wt: Path, label: str) -> str:
+        """A shell in a new tab of the space; returns its address."""
+        return self.run_terminal(ws_id, wt, label, f"{label}-{ws_id[2:14]}")
+
+    def run_terminal(self, ws_id: str, wt: Path, label: str, name: str, *argv) -> str:
+        """Start a terminal in the space's tab `label`, neither a child of this process nor reporting to it: as with a
+        pane, what the launcher starts outlives the launcher."""
+        tab = self.app_id("tb", ws_id, label)
+        res = self.call(
+            "run", "--json", "--bg", "--no-parent", "--no-notify", "--name", name, "--cwd", wt,
+            *self.tab_labels(ws_id, tab), *(["--", *argv] if argv else []),
+        )  # fmt: skip
+        for _ in range(4):  # an open window adopts the terminal a moment later and refuses the name until then
+            if self.window("tab.rename", "--id", tab, "--name", label) != 1:
+                break
+            time.sleep(0.5)
+        return res["address"]
+
+    def tab_of(self, ws_id: str, label: str) -> str | None:
+        tab = self.app_id("tb", ws_id, label)
+        return tab if self.terminals(*self.tab_labels(ws_id, tab)) else None
+
+    def close_tab(self, tab: str):
+        self.end(self.terminals("--label", f"herdr.tab={tab}"))
+
+    def sidebar(self, wt: Path, text: str):
+        """The space's name carries the feature's state: the sidebar shows it with nothing to configure."""
+        if self.available() and self.workspace_of(wt):
+            self.window("space.rename", "--id", self.space_id(wt), "--name", f"{Path(wt).name} · {text[:80]}")
+
+    # --- agents
+    def prompt(self, name: str, text: str):
+        self.call("send", name, text)
+
+    def notify(self, pane: str, text: str):
+        """Prompt the agent in terminal `pane`. A terminal with no reported status is a shell, where `send` would run
+        the text as a command."""
+        try:
+            if self.call("get", pane).get("status"):
+                self.prompt(pane, text)
+        except HerdrError as e:
+            if e.code != "not_found":
+                print(f"(could not notify terminal {pane}: {e.code}: {e.message})")
+
+    def wait(self, name: str, timeout_ms: int) -> tuple[bool, str]:
+        try:
+            res = self.call("wait", name, "--timeout", max(1, timeout_ms // 1000))
+        except HerdrError as e:
+            return True, e.code
+        return res.get("reason") not in ("timeout", "message"), ""
+
+    def state(self, name: str) -> str:
+        try:
+            t = self.call("get", name)
+        except HerdrError:
+            return "gone"
+        if t.get("state") != "live":
+            return "gone"
+        return (t.get("status") or {}).get("state") or "?"
+
+    def screen(self, name: str, lines: int = 40, source: str = "recent-unwrapped") -> str:
+        try:
+            return self.call("read", name, "--lines", 0 if source == "visible" else lines).get("raw", "")
+        except HerdrError:
+            return ""
+
+    def press(self, name: str, keys: tuple):
+        self.call("keys", name, *keys)
+        time.sleep(1)  # the keys take a moment to land
+
+    def start_agent(self, ws_id: str, wt: Path, role: str, name: str, agent: AgentConfig):
+        self.run_terminal(ws_id, wt, role, name, agent.harness, *agent.cli_args())
+
+    def submit(self, name: str, text: str, timeout_ms: int) -> tuple[bool, str]:
+        try:
+            res = self.call("send", "--wait", "--timeout", max(1, timeout_ms // 1000), name, text)
+        except HerdrError as e:
+            if e.code == "blocked":
+                return True, "agent_blocked"
+            raise
+        if res.get("started") is False:  # the text sits unsubmitted in the input box
+            if self.state(name) != "idle":
+                return True, "agent_prompt_stalled"
+            print(f"{name}: the prompt stalled with the agent idle; sending Enter")
+            self.call("keys", name, "enter")
+            return self.wait(name, timeout_ms)
+        waited = res.get("wait") or {}
+        if waited.get("reason") in ("timeout", "message"):
+            return False, ""
+        return True, "agent_blocked" if waited.get("status") == "blocked" else ""
+
+    # --- the driver's tab
+    def driver_tab_pane(self, ws_id: str) -> str | None:
+        tab = self.app_id("tb", ws_id, "driver")
+        return next((t["address"] for t in self.live(*self.tab_labels(ws_id, tab))), None)
+
+    def run_in_pane(self, pane: str, command: str):
+        self.call("send", pane, command)
+
+
+def pick_runtime(env=os.environ) -> Herdr:
+    """The runtime this process lives in, innermost first: the terminal app sets HERDR_ENV in its panes (also when it
+    runs inside a terminal of the app), herdr-core sets HC_TERMINAL_ID in its terminals. Started outside both: the one
+    installed; both installed: the terminal app, whose `start` works from anywhere. The two share no agents: a feature
+    is plain git, so another runtime can `drive` it, in a workspace of its own."""
+    if env.get("HERDR_ENV") == "1":
+        return Herdr()
+    if env.get("HC_TERMINAL_ID") or (shutil.which("hc") and not shutil.which("herdr")):
+        return HerdrApp()
+    return Herdr()
+
+
+HERDR = pick_runtime()
 
 
 def agent_name(role: str, slug: str, root: Path) -> str:
@@ -1684,7 +1954,7 @@ class Driver:
             if limit and minutes >= limit:
                 self.stop(
                     f"needs you: {role} still working after {minutes} min (max_role_minutes {limit}); "
-                    f"inspect: herdr agent read {name} --source recent-unwrapped --lines 120",
+                    f"inspect: {HERDR.read_hint(name)}",
                     EXIT_ATTENTION,
                 )
             settled, note = HERDR.wait(name, DRIVE_WAIT_MS)
@@ -1719,11 +1989,7 @@ class Driver:
             HERDR.close_role_tab(self.wt, role)
             self.msg = "check fails:\n" + "\n".join(out.errors) + "\nFix it."
             return
-        where = (
-            "its agent is gone"
-            if out.agent_state == "gone"
-            else f"inspect: herdr agent read {run.name} --source recent-unwrapped --lines 120"
-        )
+        where = "its agent is gone" if out.agent_state == "gone" else f"inspect: {HERDR.read_hint(run.name)}"
         self.stop(f"needs you: {role} stopped ({out.note or 'see its screen'}); {where}", EXIT_ATTENTION)
 
     def spawn_merge(self):
@@ -1733,10 +1999,12 @@ class Driver:
         self.lock.release()  # `merge` refuses while a driver runs; this one is done
         cmd = [sys.executable, str(Path(__file__).resolve()), "merge", self.slug]
         cmd += ["--notify", self.notify_pane] if self.notify_pane else []  # `merge` reports its own outcome
+        env = {k: v for k, v in os.environ.items() if k != "HC_SCOPE"}  # with it, ending this terminal ends `merge`
         with log.open("w") as fh:
             subprocess.Popen(
-                cmd, cwd=main, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True
-            )
+                cmd, cwd=main, env=env, stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )  # fmt: skip
         self.log(f"merging {self.slug} in the background (log: {log}); this workspace closes when it is done")
         raise _Stop(EXIT_DONE)
 
@@ -1798,14 +2066,14 @@ class Doctor:
         self.setup(cfg)
         print()
         self.check(shutil.which("git") is not None, "git in PATH")
-        self.check(Herdr.available(), "herdr in PATH", "https://herdr.dev/docs/install/")
+        self.check(HERDR.available(), f"{HERDR.binary} in PATH (runtime: {HERDR.label})", HERDR.install)
         self.config(cfg)
         self.project_section()
         self.baseline(cfg)
         if self.models:
             self.models_check(cfg)
         self.git_leftovers(cfg.base_branch)
-        if Herdr.available():
+        if HERDR.available():
             self.herdr_state()
         for n in self.notes:
             print("note  " + n)
@@ -1892,7 +2160,7 @@ class Doctor:
         for b in Git(root).run("for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines():
             merged = (root / "harness" / "features" / b / "spec.md").exists()
             if b != base and b not in live and (merged or Git(root).ref_exists(APPROVED_REF.format(slug=b))):
-                fix = f"git branch -D {b}" if merged else f"herdr worktree open --cwd {root} --branch {b}"
+                fix = f"git branch -D {b}" if merged else HERDR.reopen_hint(root, b)
                 why = "its feature is merged" if merged else "its feature is not merged"
                 self.check(False, f"branch '{b}' has no worktree ({why})", fix)
         for ref in Git(root).run("for-each-ref", "--format=%(refname)", "refs/harness", check=False).splitlines():
@@ -1905,9 +2173,9 @@ class Doctor:
         try:
             wss = HERDR.workspaces()
         except HerdrError as e:
-            self.check(False, f"herdr server reachable ({e.code}: {e.message})", "open herdr")
+            self.check(False, f"{HERDR.label} server reachable ({e.code}: {e.message})", f"open {HERDR.label}")
             return
-        self.check(True, "herdr server reachable")
+        self.check(True, f"{HERDR.label} server reachable")
         for w in wss:
             info = w.get("worktree") or {}
             checkout = Path(info["checkout_path"]) if info.get("checkout_path") else None
@@ -1924,7 +2192,7 @@ class Doctor:
                 )
         cfgp = self.herdr_cfg
         text = cfgp.read_text() if cfgp.exists() else ""
-        if "$harness" not in text:
+        if HERDR.sidebar_config and "$harness" not in text:
             self.notes.append(
                 f"herdr's sidebar does not show feature states yet. Add to {cfgp}:\n{SIDEBAR_ROWS}\n"
                 "then: herdr server reload-config"
@@ -2043,13 +2311,13 @@ def cmd_start(a):
 
 def drive_in_tab(root: Path, wt: Path, slug: str, msg: str) -> int:
     """Run the driver in the `driver` tab of the feature's workspace; it prompts this pane when it stops."""
-    pane = HERDR.launch_driver(Git(root).main_checkout(), wt, slug, msg, os.environ.get("HERDR_PANE_ID", ""))
+    pane = HERDR.launch_driver(Git(root).main_checkout(), wt, slug, msg, HERDR.self_id())
     print(
         f"driver for {slug}: pane {pane}, tab 'driver' of its workspace. It runs the roles one after another "
         "and stops when the feature needs a human; then it prompts this pane (if an agent runs here) "
         "and `status` says what to do."
     )
-    print(f"watch: herdr pane read {pane} --lines 40")
+    print(f"watch: {HERDR.pane_hint(pane)}")
     return 0
 
 
@@ -2202,7 +2470,10 @@ def parser() -> argparse.ArgumentParser:
         "--tab", action="store_true", help="run it in the 'driver' tab of the feature's workspace and return at once"
     )
     s.add_argument(
-        "--notify", default="", metavar="PANE", help="herdr pane (hosting an agent) to prompt when the driver stops"
+        "--notify",
+        default="",
+        metavar="PANE",
+        help="pane or terminal (hosting an agent) to prompt when the driver stops",
     )
     s.add_argument("--msg-file", default="", help=argparse.SUPPRESS)  # how `drive --tab` hands over the message
     s.set_defaults(fn=cmd_drive)
@@ -2215,7 +2486,7 @@ def parser() -> argparse.ArgumentParser:
     s = sub.add_parser("merge", help="merge an approved, reviewed feature; remove the worktree (human, base branch)")
     s.add_argument("slug")
     s.add_argument(
-        "--notify", default="", metavar="PANE", help="herdr pane (hosting an agent) to prompt with the outcome"
+        "--notify", default="", metavar="PANE", help="pane or terminal (hosting an agent) to prompt with the outcome"
     )
     s.set_defaults(fn=cmd_merge)
 

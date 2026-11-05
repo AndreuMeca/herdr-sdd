@@ -33,5 +33,6 @@ Tests run with `test_cmd` in `harness/config.json`.
 - Commands: `python3 harness/harness.py --help`
 - Config (agent per role, gates, commands, files copied into worktrees): `harness/config.json`, explained in `harness/help/config.md`
 - Features: `harness/features/<slug>/{spec,tasks,spec_review,log,review,questions}.md`
-- herdr beyond `harness.py` (inside herdr, `HERDR_ENV=1`): `herdr --skill`
+- herdr beyond `harness.py`: terminal app (`HERDR_ENV=1`) `herdr --skill`; desktop app (`HC_TERMINAL_ID` set)
+  `hc --skill` for terminals and agents, `herdr-app --skill` for the window
 - The launcher's own tests, `python3 harness/selftest.py`: only for changes to `harness/`

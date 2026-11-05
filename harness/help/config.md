@@ -75,7 +75,7 @@ CLI (tables below), and `doctor` prints one `flags` line per role with the exact
 
 | key | required | values | what it does |
 |---|---|---|---|
-| `harness` | yes | the agent CLI, by its herdr agent kind: `claude`, `codex`, `gemini`, `opencode`, ... (`herdr agent start --help` lists them) | The CLI herdr starts for the role, installed and logged in. It picks the model provider; `opencode` takes the provider in the model string. |
+| `harness` | yes | the agent CLI, by its herdr agent kind: `claude`, `codex`, `gemini`, `opencode`, ... (`herdr agent start --help` lists them) | The CLI herdr starts for the role, installed and logged in. In the desktop app it is the command itself, and it must report its status (OSC 7501: Claude Code and Codex do). It picks the model provider; `opencode` takes the provider in the model string. |
 | `model` | no | the provider's model id, or `""` | Passed as `--model`; empty = the CLI's default. Kept as the provider names it, so you always see what you pay for; `doctor --models` checks it (Claude Code and Codex). |
 | `effort` | no | `low`, `medium`, `high`, `extra`, `max`, or `""` | How hard the model thinks, by meaning, translated per CLI (table below). Empty = the CLI's default. |
 | `permissions` | for `claude`, `codex`, `pi` | `guarded`, `full` | What the agent may do without asking (table below). Roles run unattended, so there is no level that asks. For any other CLI leave it out and put the CLI's own flags in `args`. |
@@ -145,8 +145,9 @@ model ids your account can run (`doctor --models` tells). Replace `gates` and `a
 ## herdr's sidebar
 
 The launcher reports each feature's state (`spec ready · needs you: approve`, `implementer · working`,
-...) as the Space token `$harness` of its workspace. herdr shows custom tokens only when the layout names
-them: add once to `~/.config/herdr/config.toml` and run `herdr server reload-config` (`doctor` reminds you):
+...). In the desktop app the space's name carries it, nothing to set up, whenever a window is open. In the
+terminal app it is the Space token `$harness` of the workspace, and herdr shows custom tokens only when the layout
+names them: add once to `~/.config/herdr/config.toml` and run `herdr server reload-config` (`doctor` reminds you):
 ```toml
 [ui.sidebar.spaces]
 rows = [["state_icon", "workspace"], ["branch", "git_status"], ["$harness"]]
