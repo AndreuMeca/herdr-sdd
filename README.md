@@ -58,8 +58,9 @@ space when it opens. Details: `harness/docs/sdd.md` §9.
 ## Template updates
 With `update_harness` on in `harness/config.json` (shipped `true`), `doctor`, and so every `start`, compares the
 harness with this template's latest version on GitHub. When it is behind, your agent shows you which files differ
-and, on your yes, runs `python3 harness/harness.py update`, which takes them and commits. Your `config.json`,
-`AGENTS.md` §1 and features are never touched. Details: `harness/help/config.md`, "Template updates".
+and, on your yes, runs `python3 harness/harness.py update`, which takes them and commits. It only touches
+`harness/`: your `config.json`, your features, `AGENTS.md`, `README.md` and the rest of the repo stay as they are.
+Details: `harness/help/config.md`, "Template updates".
 
 ## Layout
 ```

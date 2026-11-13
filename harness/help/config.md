@@ -150,20 +150,20 @@ model ids your account can run (`doctor --models` tells). Replace `gates` and `a
 With `update_harness` set to `true`, `doctor`, and so every `start`, fetches the template's latest version
 (`TEMPLATE_URL` in `harness/harness.py`: the GitHub repo this one was made from; a fork of the template changes
 it there) and compares it with the main checkout's last commit. The template owns `harness/` except
-`config.json` and the feature folders, and `AGENTS.md` from §2 on; `config.json`, `AGENTS.md` §1, the
-feature folders and every other file of the repo (`README.md` included) are the project's and never compared.
-A file that differs fails the check, so `start` refuses until you update or set the key to `false`; `doctor`
-lists each one as `new`, `changed` or `removed` (a file you added under `harness/` is `removed`: the template
-does not have it). A repo whose history already holds the template's latest commit (the template
-itself, a clone that kept its history) is up to date: what differs there is its own change. When the template
-cannot be fetched (offline, a private repo without credentials), `doctor` notes it and nothing fails.
+`config.json` and the feature folders; those two and every file outside `harness/` (`AGENTS.md` and
+`README.md` included, whatever you wrote in them) are the project's and never compared. A file that differs
+fails the check, so `start` refuses until you update or set the key to `false`; `doctor` lists each one as
+`new`, `changed` or `removed` (a file you added under `harness/` is `removed`: the template does not have it).
+A repo whose history already holds the template's latest commit (the template itself, a clone that kept its
+history) is up to date: what differs there is its own change. When the template cannot be fetched (offline, a
+private repo without credentials), `doctor` notes it and nothing fails.
 
-`python3 harness/harness.py update` takes the template's version of the files listed (for `AGENTS.md`: your
-§1, the template's rest) and commits it on the base branch as `chore: harness update to template <sha>`. It
-refuses while a driver runs or while one of those files has uncommitted changes. What it brings is code that
-runs as you: read the commit (`git show`). Then run `doctor`: a key the new harness needs and your
-`config.json` lacks is named there, and the keys table above says what it takes. A feature's worktree keeps
-the harness files it forked with until the driver merges the base branch in, before each review of the code.
+`python3 harness/harness.py update` takes the template's version of the files listed and commits it on the
+base branch as `chore: harness update to template <sha>`. It refuses while a driver runs or while one of those
+files has uncommitted changes. What it brings is code that runs as you: read the commit (`git show`). Then run
+`doctor`: a key the new harness needs and your `config.json` lacks is named there, and the keys table above
+says what it takes. A feature's worktree keeps the harness files it forked with until the driver merges the
+base branch in, before each review of the code.
 
 ## herdr's sidebar
 
