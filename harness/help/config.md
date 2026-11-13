@@ -22,6 +22,8 @@ and the fix.
 4. `agents`: the CLI, model, effort and permissions of each role ("agents.<role>" below). `doctor --models`
    checks each model id with one tiny prompt.
 5. `gates`: leave both `human` until you trust the roles with your project ("Fully automatic" below).
+6. `update_harness`: leave it `true` to hear of the template's changes before a feature starts; `false` when you
+   change the harness's own files on purpose ("Template updates" below).
 
 | stack | `setup_cmd` | `test_cmd` |
 |---|---|---|
@@ -40,6 +42,7 @@ and the fix.
 | `copy_files` | no | paths or globs relative to the repo root, default `[]` | Gitignored files `start` copies from the main checkout into the worktree: `[".env"]`. Tracked paths are skipped; copies, not links. Not `.venv` or `node_modules`: `setup_cmd` rebuilds them. `doctor` notes a pattern that matches nothing in the main checkout. |
 | `max_review_rounds` | no | integer, default `3`, `0` = no limit | After this many `CHANGES_REQUESTED` reviews of one kind (spec or code) the launcher asks the human in `questions.md` (and again after every further one). |
 | `max_role_minutes` | no | integer, default `180`, `0` = no limit | When one role run (prompt to settled) takes longer, the driver stops and prompts the orchestrator ("still working after N min"). The agent keeps running: wait until it finishes (its screen), then `drive <slug> --tab` commits what it left and judges it; a `drive` while it still works starts a fresh agent in its place. |
+| `update_harness` | no | `true` or `false`, default `false` | `true`: `doctor`, and so `start`, also fetches the template's latest version from GitHub and fails while a file the template owns differs from it; `update` takes that version ("Template updates" below). The shipped file sets it to `true`. |
 | `gates.approve`, `gates.merge` | no | `human` or `auto`; a missing key means `human` | `human`: the driver stops and prompts the orchestrator. `auto`: the driver runs the command itself. The shipped file sets both to `human`. |
 | `agents.<role>` | yes, all four | object, below | Which agent CLI and model run `spec_author`, `spec_reviewer`, `implementer` and `reviewer`. |
 
@@ -141,6 +144,26 @@ model ids your account can run (`doctor --models` tells). Replace `gates` and `a
   "reviewer":      { "harness": "codex",  "model": "gpt-6-astra",      "effort": "extra", "permissions": "guarded" }
 }
 ```
+
+## Template updates
+
+With `update_harness` set to `true`, `doctor`, and so every `start`, fetches the template's latest version
+(`TEMPLATE_URL` in `harness/harness.py`: the GitHub repo this one was made from; a fork of the template changes
+it there) and compares it with the main checkout's last commit. The template owns `harness/` except
+`config.json` and the feature folders, and `AGENTS.md` from §2 on; `config.json`, `AGENTS.md` §1, the
+feature folders and every other file of the repo (`README.md` included) are the project's and never compared.
+A file that differs fails the check, so `start` refuses until you update or set the key to `false`; `doctor`
+lists each one as `new`, `changed` or `removed` (a file you added under `harness/` is `removed`: the template
+does not have it). A repo whose history already holds the template's latest commit (the template
+itself, a clone that kept its history) is up to date: what differs there is its own change. When the template
+cannot be fetched (offline, a private repo without credentials), `doctor` notes it and nothing fails.
+
+`python3 harness/harness.py update` takes the template's version of the files listed (for `AGENTS.md`: your
+§1, the template's rest) and commits it on the base branch as `chore: harness update to template <sha>`. It
+refuses while a driver runs or while one of those files has uncommitted changes. What it brings is code that
+runs as you: read the commit (`git show`). Then run `doctor`: a key the new harness needs and your
+`config.json` lacks is named there, and the keys table above says what it takes. A feature's worktree keeps
+the harness files it forked with until the driver merges the base branch in, before each review of the code.
 
 ## herdr's sidebar
 
