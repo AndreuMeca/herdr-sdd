@@ -612,8 +612,8 @@ class ConfigTests(Case):
     def test_defaults_and_main_checkout(self):
         cfg = self.r.cfg()
         self.assertEqual(
-            (cfg.gates, cfg.max_review_rounds, cfg.setup_cmd, cfg.copy_files),
-            ({"approve": "human", "merge": "human"}, 3, "", (".env",)),
+            (cfg.gates, cfg.max_review_rounds, cfg.setup_cmd, cfg.copy_files, cfg.update_harness),
+            ({"approve": "human", "merge": "human"}, 3, "", (".env",), False),
         )
         (self.r.wt / "harness" / "config.json").write_text(
             json.dumps({"base_branch": "main", "test_cmd": "false", "agents": AGENTS})
@@ -636,6 +636,7 @@ class ConfigTests(Case):
             {"base_branch": "main", "test_cmd": "", "agents": AGENTS},
             {"base_branch": 5, "test_cmd": "true", "agents": AGENTS},
             {"base_branch": "main", "test_cmd": ["pytest"], "agents": AGENTS},
+            {"base_branch": "main", "test_cmd": "true", "agents": AGENTS, "update_harness": "yes"},
         ]
         for raw in bad:
             (self.r.root / "harness" / "config.json").write_text(json.dumps(raw))
@@ -2938,6 +2939,147 @@ class HerdrAppAdapter(Case):
             driver.spawn_merge()
         self.assertNotIn("HC_SCOPE", seen["env"])
         self.assertTrue(seen["start_new_session"])
+
+
+# ----------------------------------------------------------------------------- template updates
+AGENTS_MD = "# AGENTS.md\n\n## 1. Project\n{project}\n\n## 2. Two lanes\n{lanes}\n"
+FILLED, PLACEHOLDER = "- What it is: a photo renamer", "- What it is: <one paragraph>"
+
+
+class TemplateUpdates(Case):
+    """`update_harness` and `update` against a stand-in for the template on GitHub: a repo of its own, its history
+    unrelated to the project's (as GitHub's "Use this template" leaves it), holding the harness the project got."""
+
+    def setUp(self):
+        super().setUp()
+        self.chdir(self.r.root)
+        (self.r.root / "AGENTS.md").write_text(AGENTS_MD.format(project=FILLED, lanes="- old"))
+        login = self.r.root / "harness" / "features" / "login"
+        login.mkdir()
+        (login / "spec.md").write_text("# Login\n")  # a merged feature
+        self.r.write_cfg(update_harness=True)
+        self.r.commit("project")
+        self.tpl = self.r.tmp / "template"
+        shutil.copytree(self.r.root / "harness", self.tpl / "harness")
+        shutil.rmtree(self.tpl / "harness" / "features" / "login")
+        (self.tpl / "harness" / "config.json").write_text("{}\n")
+        (self.tpl / "AGENTS.md").write_text(AGENTS_MD.format(project=PLACEHOLDER, lanes="- old"))
+        self.r.git("init", "-q", "-b", "main", cwd=self.tpl)
+        self.new_repo(self.tpl, "template")
+        self.stub("TEMPLATE_URL", str(self.tpl))
+
+    def new_repo(self, path: Path, msg: str):
+        self.r.git("config", "user.email", "t@example.com", cwd=path)
+        self.r.git("config", "user.name", "t", cwd=path)
+        self.r.commit(msg, cwd=path)
+
+    def doctor(self):
+        doc = h.Doctor(self.r.root)
+        _, out = self.output(doc.template)
+        return doc, out
+
+    def template_moves_on(self):
+        """What the template's maintainer pushes: a changed role, a new one, a removed one, AGENTS.md from §2 on."""
+        roles = self.tpl / "harness" / "roles"
+        (roles / "implementer.md").write_text("# Role: implementer\nnew\n")
+        (roles / "tester.md").write_text("# Role: tester\n")
+        (roles / "reviewer.md").unlink()
+        (self.tpl / "AGENTS.md").write_text(AGENTS_MD.format(project=PLACEHOLDER, lanes="- new"))
+        self.r.commit("template v2", cwd=self.tpl)
+
+    def test_doctor_names_what_the_template_changed(self):
+        doc, out = self.doctor()
+        self.assertIn("ok    harness files are the template's latest (main at ", out)
+        self.assertEqual(doc.problems, [], "config.json, AGENTS.md §1 and the feature folders are the project's")
+        self.output(doc.git_leftovers, "main")
+        self.assertEqual(doc.problems, [], "the fetched template is not one of a feature's marks")
+        self.template_moves_on()
+        doc, out = self.doctor()
+        self.assertIn("FAIL  harness files are the template's latest", out)
+        self.assertIn(f"fix: {h.CMD} update: takes the template's version of these files", out)
+        lines = [line for line in out.splitlines() if line.startswith("      | ")]
+        self.assertEqual(
+            lines,
+            [
+                "      | changed  harness/roles/implementer.md",
+                "      | removed  harness/roles/reviewer.md",
+                "      | new      harness/roles/tester.md",
+                "      | changed  AGENTS.md",
+            ],
+        )
+
+    def test_doctor_compares_only_with_update_harness(self):
+        self.template_moves_on()
+        self.r.write_cfg()
+        self.assertFalse(self.r.cfg().update_harness, "left out: false")
+        _, out = self.output(h.Doctor(self.r.root, tests=False).run)
+        self.assertIn("  update_harness     no\n", out)
+        self.assertNotIn("template's latest", out)
+        self.r.write_cfg(update_harness=True)
+        _, out = self.output(h.Doctor(self.r.root, tests=False).run)
+        self.assertIn(f"  update_harness     yes: compared with {self.tpl} (main)\n", out)
+        self.assertIn("FAIL  harness files are the template's latest", out)
+
+    def test_a_template_it_cannot_fetch_is_a_note(self):
+        self.stub("TEMPLATE_URL", str(self.r.tmp / "nowhere"))
+        doc, out = self.doctor()
+        self.assertEqual((out, doc.problems), ("", []))
+        self.assertIn("update_harness: the harness is not compared, cannot fetch", doc.notes[0])
+
+    def test_a_repo_that_holds_the_templates_commit_is_up_to_date(self):
+        """The template itself, or a clone that kept its history: what differs from it is the repo's own change."""
+        clone = self.r.tmp / "clone"
+        self.r.git("clone", "-q", str(self.r.root), str(clone))
+        self.stub("TEMPLATE_URL", str(clone))
+        (self.r.root / "harness" / "roles" / "implementer.md").write_text("ahead of the template\n")
+        self.r.commit("harness: not pushed yet")
+        doc, out = self.doctor()
+        self.assertEqual(doc.problems, [], out)
+        (clone / "harness" / "roles" / "spec_author.md").write_text("pushed from elsewhere\n")
+        self.new_repo(clone, "the template moves on")
+        doc, out = self.doctor()
+        self.assertIn("      | changed  harness/roles/spec_author.md", out)
+
+    def test_update_takes_the_template_and_keeps_the_projects_files(self):
+        self.template_moves_on()
+        code, out = self.output(h.cmd_update, Namespace())
+        self.assertEqual(code, 0)
+        sha = self.r.git("rev-parse", "--short", "main", cwd=self.tpl)
+        self.assertEqual(self.r.git("log", "-1", "--format=%s"), f"chore: harness update to template {sha}")
+        self.assertIn("removed  harness/roles/reviewer.md\n", out)
+        self.assertIn(f"next: {h.CMD} doctor", out)
+        roles = self.r.root / "harness" / "roles"
+        self.assertEqual((roles / "implementer.md").read_text(), "# Role: implementer\nnew\n")
+        self.assertTrue((roles / "tester.md").exists())
+        self.assertFalse((roles / "reviewer.md").exists())
+        agents_md = (self.r.root / "AGENTS.md").read_text()
+        self.assertEqual(agents_md, AGENTS_MD.format(project=FILLED, lanes="- new"), "§1 stays the project's")
+        self.assertTrue(self.r.cfg().update_harness, "config.json stays the project's")
+        self.assertTrue((self.r.root / "harness" / "features" / "login" / "spec.md").exists())
+        self.assertFalse(h.Git(self.r.root).dirty(), "all of it committed, nothing else touched")
+        doc, _ = self.doctor()
+        self.assertEqual(doc.problems, [])
+        _, out = self.output(h.cmd_update, Namespace())
+        self.assertIn("nothing to update", out)
+
+    def test_update_refuses_to_overwrite_or_to_run_under_a_driver(self):
+        self.template_moves_on()
+        (self.r.root / "harness" / "roles" / "implementer.md").write_text("my edit\n")
+        with self.assertRaises(h.Die) as cm:
+            self.output(h.cmd_update, Namespace())
+        self.assertIn("uncommitted changes in harness/roles/implementer.md", cm.exception.msg)
+        self.r.git("checkout", "--", "harness/roles/implementer.md")
+        holder = hold_lock(self, h.Lock.driver(self.r.wt))
+        with self.assertRaises(h.Die) as cm:
+            self.output(h.cmd_update, Namespace())
+        self.assertIn("a driver is running feat", cm.exception.msg)
+        holder.kill()
+        holder.wait()
+        self.chdir(self.r.wt)
+        with self.assertRaises(h.Die) as cm:
+            self.output(h.cmd_update, Namespace())
+        self.assertIn("run update from the main checkout", cm.exception.msg)
+        self.assertEqual(self.r.git("log", "-1", "--format=%s"), "project", "nothing committed")
 
 
 if __name__ == "__main__":

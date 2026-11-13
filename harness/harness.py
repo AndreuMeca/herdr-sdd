@@ -66,6 +66,12 @@ SPEC_SECTIONS = ("Intent", "Requirements", "Design", "Verification")  # the `## 
 # what the template itself ships: a repo with nothing tracked beyond these has no project code yet
 TEMPLATE_PATHS = ("harness/", "AGENTS.md", "README.md", "LICENSE", ".gitignore")
 SECTION_PLACEHOLDERS = ("<one paragraph", "<language", "<style")  # the template's AGENTS.md §1, until filled in
+# where the template lives on GitHub, and what of it a project keeps current (`update_harness`, `update`): harness/
+# but the project's config.json and feature folders, plus AGENTS.md from its §2 on (§1 is the project's)
+TEMPLATE_URL = "https://github.com/AndreuMeca/herdr-sdd.git"
+TEMPLATE_BRANCH = "main"
+TEMPLATE_REF = "refs/harness-template"  # that branch as last fetched; outside refs/harness/, the features' marks
+TEMPLATE_OWNED = ("harness", ":(exclude)harness/config.json", ":(exclude,glob)harness/features/[a-z]*/**")
 REQ_RE = re.compile(r"^- (R\d+):\s*(.*)$")
 BOX_RE = re.compile(r"^- \[[ xX]\]")  # a checkbox line, `- [ ]` or `- [x]`
 TASK_RE = re.compile(r"^- \[([ xX])\] (T\d+):\s*(.*)$")
@@ -319,8 +325,21 @@ class Git:
         return self.ok("check-ignore", "-q", path)
 
     def show(self, rev: str, path: str) -> str:
-        """A file as it is at `rev`; empty when it is not there."""
-        return self.run("show", f"{rev}:{path}", check=False)
+        """A file as it is at `rev`, byte for byte; empty when it is not there."""
+        return self.proc("show", f"{rev}:{path}", check=False).stdout
+
+    def fetch(self, url: str, branch: str, ref: str, timeout_s: int = 60) -> str:
+        """Fetch `branch` of the repo at `url` into `ref`; the error, or empty. Never asks for a password (nobody is
+        there to type it) and gives up after timeout_s."""
+        try:
+            p = subprocess.run(
+                ["git", "fetch", "-q", "--no-tags", url, f"+refs/heads/{branch}:{ref}"],
+                cwd=self.path, text=True, capture_output=True, stdin=subprocess.DEVNULL, timeout=timeout_s,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            )  # fmt: skip
+        except subprocess.TimeoutExpired:
+            return f"no answer within {timeout_s} s"
+        return "" if p.returncode == 0 else (p.stderr or p.stdout).strip()
 
     def commit(self, msg: str, *paths):
         """Stage `paths` and commit them, only them."""
@@ -462,6 +481,7 @@ class Config:
     max_role_minutes: int
     gates: dict  # "approve" / "merge" -> "human" | "auto"
     agents: dict  # role -> AgentConfig
+    update_harness: bool  # doctor (and so start) checks the harness against the template's latest (TEMPLATE_URL)
 
     @classmethod
     def load(cls, root: Path) -> Config:
@@ -504,6 +524,7 @@ class Config:
             max_role_minutes=raw.get("max_role_minutes", DEFAULT_ROLE_MINUTES),
             gates=gates,
             agents=agents,
+            update_harness=raw.get("update_harness", False),
         )
 
     @staticmethod
@@ -514,6 +535,8 @@ class Config:
                 die(f"{p}: {key} must be an integer >= 0 (0 = no limit)")
         if not isinstance(raw.get("setup_cmd", ""), str):
             die(f'{p}: setup_cmd must be a shell command or ""')
+        if not isinstance(raw.get("update_harness", False), bool):
+            die(f"{p}: update_harness must be true or false")
 
     def agent(self, role: str) -> AgentConfig:
         return self.agents[role]
@@ -2009,6 +2032,60 @@ class Driver:
         raise _Stop(EXIT_DONE)
 
 
+# ----------------------------------------------------------------------------- template
+def split_agents_md(text: str) -> tuple[str, str]:
+    """AGENTS.md as (its start up to `## 2.`, which holds the project's §1, and the rest, which is the template's)."""
+    i = text.find("\n## 2.")
+    return (text, "") if i < 0 else (text[: i + 1], text[i + 1 :])
+
+
+class Template:
+    """The template this repo was made from (TEMPLATE_URL): which of the files it owns (TEMPLATE_OWNED, AGENTS.md from
+    §2 on) differ from its latest version, for `doctor` to say, and taking that version, for `update`."""
+
+    def __init__(self, root: Path):
+        self.git = Git(root)
+
+    def fetch(self) -> str:
+        """The template's latest version into TEMPLATE_REF; the error, or empty."""
+        return self.git.fetch(TEMPLATE_URL, TEMPLATE_BRANCH, TEMPLATE_REF)
+
+    def sha(self) -> str:
+        return self.git.run("rev-parse", "--short", TEMPLATE_REF)
+
+    def changes(self) -> list[tuple[str, str]]:
+        """[(what `update` does, path)] to make HEAD's template files the fetched ones: new, changed, removed. Nothing
+        when the fetched commit is already in this repo's history (the template itself, or a clone that kept its
+        history): what differs then is this repo's own change, not an update."""
+        if self.git.ok("merge-base", "--is-ancestor", TEMPLATE_REF, "HEAD"):
+            return []
+        diff = ("diff", "-z", "--name-status", "--no-renames", "HEAD", TEMPLATE_REF, "--", *TEMPLATE_OWNED)
+        fields = self.git.proc(*diff).stdout.split("\0")
+        words = {"A": "new", "D": "removed"}
+        found = [(words.get(s, "changed"), p) for s, p in zip(fields[0::2], fields[1::2]) if p]
+        tail = split_agents_md(self.git.show(TEMPLATE_REF, "AGENTS.md"))[1]
+        if tail and tail != split_agents_md(self.git.show("HEAD", "AGENTS.md"))[1]:
+            found.append(("changed", "AGENTS.md"))  # from §2 on: §1 is the project's
+        return found
+
+    def apply(self, changes: list[tuple[str, str]]) -> str:
+        """Take the fetched version of what `changes` names (AGENTS.md: this repo's §1, the template's rest) and
+        commit it on the current branch; the commit's subject."""
+        paths = [p for _, p in changes]
+        take = [p for what, p in changes if what != "removed" and p != "AGENTS.md"]
+        if take:
+            self.git.run("checkout", TEMPLATE_REF, "--", *take)
+        for path in (p for what, p in changes if what == "removed"):
+            (self.git.path / path).unlink()
+        if "AGENTS.md" in paths:
+            mine = split_agents_md(self.git.show("HEAD", "AGENTS.md") or self.git.show(TEMPLATE_REF, "AGENTS.md"))[0]
+            theirs = split_agents_md(self.git.show(TEMPLATE_REF, "AGENTS.md"))[1]
+            (self.git.path / "AGENTS.md").write_text(mine + ("" if mine.endswith("\n") else "\n") + theirs)
+        subject = f"chore: harness update to template {self.sha()}"
+        self.git.commit(subject, *paths)
+        return subject
+
+
 # ----------------------------------------------------------------------------- doctor
 def probe_model(cli: Cli, model: str, cwd: Path, effort: str = "", timeout_s: int = 120) -> tuple[bool, str]:
     """(answered, output tail) of one tiny prompt to the CLI with this model and effort."""
@@ -2050,6 +2127,8 @@ class Doctor:
         print(f"  max_review_rounds  {cfg.max_review_rounds or 'no limit'}")
         print(f"  max_role_minutes   {cfg.max_role_minutes or 'no limit'}")
         print(f"  gates              approve: {cfg.gates['approve']}   merge: {cfg.gates['merge']}")
+        update = f"yes: compared with {TEMPLATE_URL} ({TEMPLATE_BRANCH})" if cfg.update_harness else "no"
+        print(f"  update_harness     {update}")
         for role in ROLES:
             agent = cfg.agent(role)
             kind, model = agent.harness, agent.model or "(default model)"
@@ -2068,6 +2147,8 @@ class Doctor:
         self.check(shutil.which("git") is not None, "git in PATH")
         self.check(HERDR.available(), f"{HERDR.binary} in PATH (runtime: {HERDR.label})", HERDR.install)
         self.config(cfg)
+        if cfg.update_harness:
+            self.template()
         self.project_section()
         self.baseline(cfg)
         if self.models:
@@ -2097,12 +2178,26 @@ class Doctor:
             else:
                 self.notes.append(f"copy_files: {pat} is not in the main checkout, so new worktrees will not get it")
 
+    def template(self):
+        """`update_harness`: the files the template owns are its latest version on GitHub; `update` takes it. A
+        template it cannot fetch (offline) is a note: nothing to compare with is not a problem of this repo."""
+        t = Template(self.root)
+        err = t.fetch()
+        if err:
+            why = err.splitlines()[-1]
+            self.notes.append(f"update_harness: the harness is not compared, cannot fetch {TEMPLATE_URL}: {why}")
+            return
+        changes = t.changes()
+        fix = f"{CMD} update: takes the template's version of these files and commits it"
+        self.check(not changes, f"harness files are the template's latest ({TEMPLATE_BRANCH} at {t.sha()})", fix)
+        for what, path in changes:
+            print(f"      | {what:<8} {path}")
+
     def project_section(self):
         """AGENTS.md §1 still holding the template's placeholders: the orchestrator fills it in."""
         p = self.root / "AGENTS.md"
-        text = p.read_text() if p.exists() else ""
-        start = text.find("## 1.")
-        section = text[start : text.find("## 2.", start)] if start >= 0 else ""
+        head = split_agents_md(p.read_text() if p.exists() else "")[0]
+        section = head[head.find("## 1.") :] if "## 1." in head else ""
         if any(t in section for t in SECTION_PLACEHOLDERS):
             self.notes.append("AGENTS.md §1 is not filled in yet: the orchestrator asks you before the first feature")
 
@@ -2256,13 +2351,18 @@ def cmd_check(a):
     return 0
 
 
+def on_base_branch(root: Path, cfg: Config, cmd: str):
+    """The commands that write the base branch run from the main checkout, on that branch."""
+    if not Git(root).is_main():
+        die(f"run {cmd} from the main checkout, not from a worktree")
+    if Git(root).branch() != cfg.base_branch:
+        die(f"run {cmd} from the base branch '{cfg.base_branch}' (currently on '{Git(root).branch() or 'detached'}')")
+
+
 def start_preconditions(root: Path, cfg: Config, slug: str):
     if not SLUG_RE.fullmatch(slug):
         die(f"slug must match {SLUG_RE.pattern} (lowercase, digits, dashes; at most 20 characters)")
-    if not Git(root).is_main():
-        die("run start from the main checkout, not from a worktree")
-    if Git(root).branch() != cfg.base_branch:
-        die(f"run start from the base branch '{cfg.base_branch}' (currently on '{Git(root).branch() or 'detached'}')")
+    on_base_branch(root, cfg, "start")
     if Git(root).ref_exists(f"refs/heads/{slug}"):
         die(f"branch '{slug}' already exists")
     if slug in Feature.all(root, cfg.base_branch):
@@ -2369,10 +2469,7 @@ def cmd_drive(a):
 
 def merge_preconditions(root: Path, cfg: Config, slug: str) -> Feature:
     base = cfg.base_branch
-    if not Git(root).is_main():
-        die("run merge from the main checkout, never from inside a worktree")
-    if Git(root).branch() != base:
-        die(f"run merge from the base branch '{base}' (currently on '{Git(root).branch() or 'detached'}')")
+    on_base_branch(root, cfg, "merge")
     if Git(root).dirty(untracked=False):
         die("the main checkout has uncommitted changes; commit or stash them first")
     f = Feature.find(root, slug, base)
@@ -2447,6 +2544,34 @@ def cmd_doctor(a):
     return Doctor(Git.here().main_checkout(), tests=not a.no_tests, models=a.models).run()
 
 
+def cmd_update(a):
+    """The template's latest version of the files it owns, committed on the base branch. config.json, AGENTS.md §1
+    and the feature folders are the project's and stay as they are."""
+    root = Git.here().path
+    cfg = Config.load(root)
+    on_base_branch(root, cfg, "update")
+    feats = Feature.all(root, cfg.base_branch).values()
+    running = sorted(f.slug for f in feats if f.live and Lock.driver(f.wt).running())
+    if running:
+        die(f"a driver is running {', '.join(running)}: update once `{CMD} status` shows none working")
+    t = Template(root)
+    err = t.fetch()
+    if err:
+        die(f"cannot fetch the template, {TEMPLATE_URL} ({TEMPLATE_BRANCH}):\n{err}")
+    changes = t.changes()
+    if not changes:
+        print(f"the harness files are the template's latest ({TEMPLATE_BRANCH} at {t.sha()}): nothing to update")
+        return 0
+    dirty = sorted({p for _, p in Git(root).porcelain()} & {p for _, p in changes})
+    if dirty:
+        die(f"uncommitted changes in {', '.join(dirty)}, which the update replaces: commit or discard them first")
+    for what, path in changes:
+        print(f"{what:<8} {path}")
+    print(f"committed: {t.apply(changes)}")
+    print(f"next: {CMD} doctor; config.json is not updated: doctor names a key the new harness needs")
+    return 0
+
+
 # ----------------------------------------------------------------------------- cli
 def parser() -> argparse.ArgumentParser:
     """The command list: `--help` is its only copy."""
@@ -2503,6 +2628,11 @@ def parser() -> argparse.ArgumentParser:
         "--models", action="store_true", help="also send each Claude Code and Codex role one tiny prompt with its model"
     )
     s.set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser(
+        "update", help="take the template's latest harness files from GitHub and commit them (human, base branch)"
+    )
+    s.set_defaults(fn=cmd_update)
     return ap
 
 

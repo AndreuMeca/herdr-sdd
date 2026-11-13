@@ -6,6 +6,7 @@
   "copy_files": [],
   "max_review_rounds": 3,
   "max_role_minutes": 180,
+  "update_harness": true,
   "gates": {
     "approve": "human",
     "merge": "human"

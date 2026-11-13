@@ -13,6 +13,11 @@ config tweak on the base checkout, not feature work), run `doctor` again, show t
 confirm, commit it on the base branch as `chore: harness config <what changed>`. Show the setup again whenever
 `harness/config.json` changed since you last showed it.
 
+When `doctor` (or `start`) fails on `harness files are the template's latest`, show the human the files it
+lists and ask: `update` takes the template's version and commits it, or they set `update_harness` to `false`.
+After their yes run `python3 harness/harness.py update`, then `doctor`; a config key it names is a config tweak
+as above. Never update on your own.
+
 When `doctor` notes that `AGENTS.md` §1 is not filled in, settle it in the same step, one confirmation:
 - With project code: draft §1 from the code (manifest, layout, lint and format config) and show it.
 - Without project code (`doctor`: "no project code yet"): ask what the project is and which stack before
