@@ -2943,7 +2943,8 @@ class HerdrAppAdapter(Case):
 
 # ----------------------------------------------------------------------------- template updates
 AGENTS_MD = "# AGENTS.md\n\n## 1. Project\n{project}\n\n## 2. Two lanes\n{lanes}\n"
-FILLED, PLACEHOLDER = "- What it is: a photo renamer", "- What it is: <one paragraph>"
+# the project's AGENTS.md: §1 filled in, a line of its own in §2, a section of its own
+PROJECT_AGENTS_MD = AGENTS_MD.format(project="- What it is: a photo renamer", lanes="- old\n- ours") + "## 5. Deploy\n"
 
 
 class TemplateUpdates(Case):
@@ -2953,7 +2954,7 @@ class TemplateUpdates(Case):
     def setUp(self):
         super().setUp()
         self.chdir(self.r.root)
-        (self.r.root / "AGENTS.md").write_text(AGENTS_MD.format(project=FILLED, lanes="- old"))
+        (self.r.root / "AGENTS.md").write_text(PROJECT_AGENTS_MD)
         login = self.r.root / "harness" / "features" / "login"
         login.mkdir()
         (login / "spec.md").write_text("# Login\n")  # a merged feature
@@ -2963,7 +2964,7 @@ class TemplateUpdates(Case):
         shutil.copytree(self.r.root / "harness", self.tpl / "harness")
         shutil.rmtree(self.tpl / "harness" / "features" / "login")
         (self.tpl / "harness" / "config.json").write_text("{}\n")
-        (self.tpl / "AGENTS.md").write_text(AGENTS_MD.format(project=PLACEHOLDER, lanes="- old"))
+        (self.tpl / "AGENTS.md").write_text(AGENTS_MD.format(project="<one paragraph>", lanes="- old"))
         self.r.git("init", "-q", "-b", "main", cwd=self.tpl)
         self.new_repo(self.tpl, "template")
         self.stub("TEMPLATE_URL", str(self.tpl))
@@ -2979,18 +2980,18 @@ class TemplateUpdates(Case):
         return doc, out
 
     def template_moves_on(self):
-        """What the template's maintainer pushes: a changed role, a new one, a removed one, AGENTS.md from §2 on."""
+        """What the template's maintainer pushes: a changed role, a new one, a removed one, a changed AGENTS.md."""
         roles = self.tpl / "harness" / "roles"
         (roles / "implementer.md").write_text("# Role: implementer\nnew\n")
         (roles / "tester.md").write_text("# Role: tester\n")
         (roles / "reviewer.md").unlink()
-        (self.tpl / "AGENTS.md").write_text(AGENTS_MD.format(project=PLACEHOLDER, lanes="- new"))
+        (self.tpl / "AGENTS.md").write_text(AGENTS_MD.format(project="<one paragraph>", lanes="- new"))
         self.r.commit("template v2", cwd=self.tpl)
 
     def test_doctor_names_what_the_template_changed(self):
         doc, out = self.doctor()
         self.assertIn("ok    harness files are the template's latest (main at ", out)
-        self.assertEqual(doc.problems, [], "config.json, AGENTS.md §1 and the feature folders are the project's")
+        self.assertEqual(doc.problems, [], "config.json, AGENTS.md and the feature folders are the project's")
         self.output(doc.git_leftovers, "main")
         self.assertEqual(doc.problems, [], "the fetched template is not one of a feature's marks")
         self.template_moves_on()
@@ -3004,8 +3005,8 @@ class TemplateUpdates(Case):
                 "      | changed  harness/roles/implementer.md",
                 "      | removed  harness/roles/reviewer.md",
                 "      | new      harness/roles/tester.md",
-                "      | changed  AGENTS.md",
             ],
+            "AGENTS.md is the project's, whatever the template's says",
         )
 
     def test_doctor_compares_only_with_update_harness(self):
@@ -3052,8 +3053,7 @@ class TemplateUpdates(Case):
         self.assertEqual((roles / "implementer.md").read_text(), "# Role: implementer\nnew\n")
         self.assertTrue((roles / "tester.md").exists())
         self.assertFalse((roles / "reviewer.md").exists())
-        agents_md = (self.r.root / "AGENTS.md").read_text()
-        self.assertEqual(agents_md, AGENTS_MD.format(project=FILLED, lanes="- new"), "§1 stays the project's")
+        self.assertEqual((self.r.root / "AGENTS.md").read_text(), PROJECT_AGENTS_MD, "never touched")
         self.assertTrue(self.r.cfg().update_harness, "config.json stays the project's")
         self.assertTrue((self.r.root / "harness" / "features" / "login" / "spec.md").exists())
         self.assertFalse(h.Git(self.r.root).dirty(), "all of it committed, nothing else touched")

@@ -67,7 +67,7 @@ SPEC_SECTIONS = ("Intent", "Requirements", "Design", "Verification")  # the `## 
 TEMPLATE_PATHS = ("harness/", "AGENTS.md", "README.md", "LICENSE", ".gitignore")
 SECTION_PLACEHOLDERS = ("<one paragraph", "<language", "<style")  # the template's AGENTS.md §1, until filled in
 # where the template lives on GitHub, and what of it a project keeps current (`update_harness`, `update`): harness/
-# but the project's config.json and feature folders, plus AGENTS.md from its §2 on (§1 is the project's)
+# but the project's config.json and feature folders. Every other file, AGENTS.md included, is the project's.
 TEMPLATE_URL = "https://github.com/AndreuMeca/herdr-sdd.git"
 TEMPLATE_BRANCH = "main"
 TEMPLATE_REF = "refs/harness-template"  # that branch as last fetched; outside refs/harness/, the features' marks
@@ -2033,15 +2033,9 @@ class Driver:
 
 
 # ----------------------------------------------------------------------------- template
-def split_agents_md(text: str) -> tuple[str, str]:
-    """AGENTS.md as (its start up to `## 2.`, which holds the project's §1, and the rest, which is the template's)."""
-    i = text.find("\n## 2.")
-    return (text, "") if i < 0 else (text[: i + 1], text[i + 1 :])
-
-
 class Template:
-    """The template this repo was made from (TEMPLATE_URL): which of the files it owns (TEMPLATE_OWNED, AGENTS.md from
-    §2 on) differ from its latest version, for `doctor` to say, and taking that version, for `update`."""
+    """The template this repo was made from (TEMPLATE_URL): which of the files it owns (TEMPLATE_OWNED) differ from its
+    latest version, for `doctor` to say, and taking that version, for `update`."""
 
     def __init__(self, root: Path):
         self.git = Git(root)
@@ -2062,27 +2056,18 @@ class Template:
         diff = ("diff", "-z", "--name-status", "--no-renames", "HEAD", TEMPLATE_REF, "--", *TEMPLATE_OWNED)
         fields = self.git.proc(*diff).stdout.split("\0")
         words = {"A": "new", "D": "removed"}
-        found = [(words.get(s, "changed"), p) for s, p in zip(fields[0::2], fields[1::2]) if p]
-        tail = split_agents_md(self.git.show(TEMPLATE_REF, "AGENTS.md"))[1]
-        if tail and tail != split_agents_md(self.git.show("HEAD", "AGENTS.md"))[1]:
-            found.append(("changed", "AGENTS.md"))  # from §2 on: §1 is the project's
-        return found
+        return [(words.get(s, "changed"), p) for s, p in zip(fields[0::2], fields[1::2]) if p]
 
     def apply(self, changes: list[tuple[str, str]]) -> str:
-        """Take the fetched version of what `changes` names (AGENTS.md: this repo's §1, the template's rest) and
-        commit it on the current branch; the commit's subject."""
-        paths = [p for _, p in changes]
-        take = [p for what, p in changes if what != "removed" and p != "AGENTS.md"]
+        """Take the fetched version of what `changes` names and commit it on the current branch; the commit's
+        subject."""
+        take = [p for what, p in changes if what != "removed"]
         if take:
             self.git.run("checkout", TEMPLATE_REF, "--", *take)
         for path in (p for what, p in changes if what == "removed"):
             (self.git.path / path).unlink()
-        if "AGENTS.md" in paths:
-            mine = split_agents_md(self.git.show("HEAD", "AGENTS.md") or self.git.show(TEMPLATE_REF, "AGENTS.md"))[0]
-            theirs = split_agents_md(self.git.show(TEMPLATE_REF, "AGENTS.md"))[1]
-            (self.git.path / "AGENTS.md").write_text(mine + ("" if mine.endswith("\n") else "\n") + theirs)
         subject = f"chore: harness update to template {self.sha()}"
-        self.git.commit(subject, *paths)
+        self.git.commit(subject, *(p for _, p in changes))
         return subject
 
 
@@ -2196,8 +2181,9 @@ class Doctor:
     def project_section(self):
         """AGENTS.md §1 still holding the template's placeholders: the orchestrator fills it in."""
         p = self.root / "AGENTS.md"
-        head = split_agents_md(p.read_text() if p.exists() else "")[0]
-        section = head[head.find("## 1.") :] if "## 1." in head else ""
+        text = p.read_text() if p.exists() else ""
+        start = text.find("## 1.")
+        section = text[start : text.find("## 2.", start)] if start >= 0 else ""
         if any(t in section for t in SECTION_PLACEHOLDERS):
             self.notes.append("AGENTS.md §1 is not filled in yet: the orchestrator asks you before the first feature")
 
@@ -2545,8 +2531,8 @@ def cmd_doctor(a):
 
 
 def cmd_update(a):
-    """The template's latest version of the files it owns, committed on the base branch. config.json, AGENTS.md §1
-    and the feature folders are the project's and stay as they are."""
+    """The template's latest version of the files it owns, committed on the base branch. config.json, the feature
+    folders and every file outside harness/ (AGENTS.md included) are the project's and stay as they are."""
     root = Git.here().path
     cfg = Config.load(root)
     on_base_branch(root, cfg, "update")
