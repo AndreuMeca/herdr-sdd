@@ -145,17 +145,20 @@ launcher and rules with the main checkout's `config.json`; what `test_cmd` runs 
 - A role run is judged from the files on disk after the launcher committed them, never from the agent's
   state. Uncommitted changes found when the driver starts a step are a run the launcher did not finish
   (`max_role_minutes`, a driver that died): they are committed under the role they belong to first.
-- `drive <slug> "msg"`: the message goes to the first role run, on one line (it is typed into the agent's
-  input box, whatever its size). At a gate, `auto` or not, to the role that
-  produced what is judged (spec → spec_author, merge → implementer); when blocked, to the role the state names
-  next (§2, `questions.md`). `--tab` runs the driver in the feature's workspace and returns; when it stops, it
+- `drive <slug> "msg"`: the message goes to the first role run, as the file `message.md` in the feature
+  folder, which git ignores; the prompt typed into the agent's input box is one short line that names it,
+  whatever the message's size. At a gate, `auto` or not, to the role that
+  produced what is judged (spec → spec_author, merge → implementer); when blocked, to the role that asked: the
+  spec_author or implementer whose run wrote the question, else the role the state names next (§2,
+  `questions.md`). `--tab` runs the driver in the feature's workspace and returns; when it stops, it
   prompts the pane it was started from (when an agent runs in it) with `harness: <slug> ...`. After an `auto`
   merge, `merge` itself prompts that pane with the outcome (merged at `<sha>`, or why it failed).
 - Every role run is a fresh agent session in the role's tab of the feature's workspace, started with
   `config.json` as it is then; the previous one is closed first. Memory between runs is the feature's files
   and the driver's message. The launcher answers the startup dialogs its CLI is known to show (`CLIS` in
-  `harness.py`) and logs each one; when the first prompt stalls with the agent idle it sends Enter once;
-  anything else stops the driver for the human. The tab is closed once the run is judged; it stays when the
+  `harness.py`) and logs each one; when the first prompt stalls with the agent idle it sends Enter once, only if
+  the input box holds the prompt to its end, and the agent must then start working within 5 seconds;
+  anything else stops the driver for the human. A run is never judged while its agent is working. The tab is closed once the run is judged; it stays when the
   driver stops because of the agent (a dialog it does not know, stopped, still working, changed nothing), so
   they can look at the screen.
 - herdr is two programs that share no agents, and the launcher runs on either, nothing to configure:

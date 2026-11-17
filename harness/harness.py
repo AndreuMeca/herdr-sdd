@@ -61,6 +61,7 @@ WRITE_SET = {  # what the launcher commits after a role run, one tuple of pathsp
     "reviewer": (("{dir}/review.md", "{dir}/questions.md"),),
 }
 SLUG_RE = re.compile(r"^[a-z][a-z0-9-]{1,19}$")  # at most 20: a herdr agent name (`impl-<slug>-<6 hex>`) is at most 32
+MESSAGE_FILE = "message.md"  # the driver's message for the role run in progress, in the feature folder, ignored by git
 FEATURE_FILES = ("spec.md", "tasks.md", "log.md", "questions.md")  # plus the review forms (REVIEWS below)
 SPEC_SECTIONS = ("Intent", "Requirements", "Design", "Verification")  # the `## ` headings of spec.md, in this order
 # what the template itself ships: a repo with nothing tracked beyond these has no project code yet
@@ -82,6 +83,8 @@ RULES = Path(__file__).resolve().parent / "docs" / "sdd.md"  # the rules; §5 an
 EXIT_DONE, EXIT_ERROR, EXIT_ATTENTION = 0, 1, 2
 DRIVE_WAIT_MS = 300_000  # the driver waits for a role in slices of this length
 DEFAULT_ROLE_MINUTES = 180  # the driver stops for a human when one role run takes longer (max_role_minutes)
+PROMPT_MAX = 1024  # bytes: a terminal still in line mode keeps no more of a typed line (macOS MAX_CANON)
+PROMPT_TAIL = 40  # characters: the end of a prompt that must be on screen before a stalled one gets its Enter
 FIX_TRIES = 3  # how often the driver sends a role back to its own work before stopping for the human
 REFS = "refs/harness/{slug}/"  # the launcher's marks for a feature; `merge` drops them all
 APPROVED_REF = REFS + "approved"  # set by `approve`: the spec at this commit is the approved one
@@ -770,6 +773,12 @@ class FeatureFiles:
             fh.write(f"{head}- launcher ({datetime.now():%Y-%m-%d %H:%M}): {text}\n")
         self.git.commit(f"{self.slug}: blocked by the launcher", self.rel + "/questions.md")
 
+    def asker(self) -> str:
+        """The role whose run last wrote questions.md (its commit is `<slug>: <role>`); empty for the launcher."""
+        subject = self.git.run("log", "-1", "--format=%s", "--", self.rel + "/questions.md", check=False)
+        role = subject.removeprefix(f"{self.slug}: ")
+        return role if role in WRITE_SET else ""
+
     def answer(self) -> str:
         """The human answered (`drive <slug> "<answer>"`): the questions, cleared from questions.md and committed."""
         asked = "\n".join(self.questions())
@@ -967,6 +976,7 @@ class Herdr:
     install = "https://herdr.dev/docs/install/"
     dialog_states = ("blocked",)  # the agent states in which a startup dialog may be on its screen
     startup_s = 60  # how long an agent gets to reach idle
+    enter_s = 5  # how long it gets to start working after an Enter (what `herdr agent prompt --wait` gives it)
     sidebar_config = True  # the sidebar shows feature states only once the human's config names them
 
     def available(self) -> bool:
@@ -1157,9 +1167,12 @@ class Herdr:
             state = self.state(name)
         return state
 
+    def send_keys(self, name: str, *keys):
+        self.call("agent", "send-keys", name, *keys)
+
     def press(self, name: str, keys: tuple):
         """Answer a startup dialog."""
-        self.call("agent", "send-keys", name, *keys)
+        self.send_keys(name, *keys)
         with contextlib.suppress(HerdrError):  # the keys take a moment to land; `blocked` would return at once
             self.call("agent", "wait", name, "--until", "idle", "--until", "done", "--timeout", 10_000)
 
@@ -1201,13 +1214,27 @@ class Herdr:
             if e.code == "timeout":
                 return False, ""
             if e.code == "agent_prompt_stalled" and self.state(name) == "idle":
-                # the text sits unsubmitted in the input box (seen live right after a startup dialog): Enter once
-                print(f"{name}: the prompt stalled with the agent idle; sending Enter")
-                self.call("agent", "send-keys", name, "enter")
-                return self.wait(name, timeout_ms)
+                return self.enter(name, text, timeout_ms)
             if e.code in ("agent_blocked", "agent_prompt_stalled"):
                 return True, e.code
             raise
+
+    def enter(self, name: str, text: str, timeout_ms: int) -> tuple[bool, str]:
+        """The prompt sits unsubmitted in the input box of an idle agent (seen live right after a startup dialog, and
+        when the text reached the terminal before the CLI's input box was live): Enter once, and only when the box
+        holds the prompt to its end, never a fragment. The agent must then be seen working before its turn is
+        waited for: a wait right after the Enter would take the idle it has not left yet for the end of the run."""
+        tail = "".join(text.split())[-PROMPT_TAIL:]  # the box wraps the line: compare without whitespace
+        if tail not in "".join(self.screen(name, source="visible").split()):
+            return True, "prompt truncated in the input box"
+        print(f"{name}: the prompt stalled with the agent idle; sending Enter")
+        self.send_keys(name, "enter")
+        deadline = time.time() + self.enter_s
+        while self.state(name) not in ("working", "blocked"):
+            if time.time() >= deadline:
+                return True, "prompt stalled; Enter did not start the agent"
+            time.sleep(0.25)
+        return self.wait(name, timeout_ms)
 
     # --- the driver's tab
     def driver_tab_pane(self, ws_id: str) -> str | None:
@@ -1447,8 +1474,11 @@ class HerdrApp(Herdr):
         except HerdrError:
             return ""
 
-    def press(self, name: str, keys: tuple):
+    def send_keys(self, name: str, *keys):
         self.call("keys", name, *keys)
+
+    def press(self, name: str, keys: tuple):
+        self.send_keys(name, *keys)
         time.sleep(1)  # the keys take a moment to land
 
     def start_agent(self, ws_id: str, wt: Path, role: str, name: str, agent: AgentConfig):
@@ -1464,9 +1494,7 @@ class HerdrApp(Herdr):
         if res.get("started") is False:  # the text sits unsubmitted in the input box
             if self.state(name) != "idle":
                 return True, "agent_prompt_stalled"
-            print(f"{name}: the prompt stalled with the agent idle; sending Enter")
-            self.call("keys", name, "enter")
-            return self.wait(name, timeout_ms)
+            return self.enter(name, text, timeout_ms)
         waited = res.get("wait") or {}
         if waited.get("reason") in ("timeout", "message"):
             return False, ""
@@ -1742,14 +1770,19 @@ class RoleRun:
         self.start_sha = ""
 
     @staticmethod
-    def prompt_for(role: str, slug: str, msg: str, base: str, bootstrap: bool = False) -> str:
+    def prompt_for(role: str, slug: str, msg: bool, base: str, bootstrap: bool = False) -> str:
         """The job line: the role file, the feature, what the launcher knows (the base branch; whether the project has
-        code yet), then the driver's message."""
+        code yet), then where the driver's message is, when there is one. One short line whatever the message: it is
+        typed into the agent's terminal, which may keep only PROMPT_MAX bytes of it."""
         facts = f"base branch: {base}" + (
             "; no project code yet: this feature sets the project up" if bootstrap else ""
         )
         text = f"Read harness/roles/{role}.md and follow it for harness/features/{slug}/ ({facts})."
-        return text + (" " + " ".join(msg.split()) if msg else "")
+        if msg:
+            text += f" This run's message is in harness/features/{slug}/{MESSAGE_FILE}: read it first."
+        if len(text.encode()) >= PROMPT_MAX:
+            die(f"the prompt for {role} is {len(text.encode())} bytes, over what a terminal line takes: {text[:80]}...")
+        return text
 
     def start(self):
         """Remember where the run starts: finish() folds everything after it."""
@@ -1757,7 +1790,12 @@ class RoleRun:
 
     def send(self, msg: str, timeout_ms: int) -> tuple[bool, str]:
         """Prompt the role agent with its job (starting it if needed); (settled, note)."""
-        text = self.prompt_for(self.role, self.slug, msg, self.cfg.base_branch, not self.git.project_paths())
+        path = self.files.dir / MESSAGE_FILE  # git ignores it (harness/.gitignore): it is this run's, never committed
+        if msg:
+            path.write_text(msg.strip() + "\n")
+        else:
+            path.unlink(missing_ok=True)
+        text = self.prompt_for(self.role, self.slug, bool(msg), self.cfg.base_branch, not self.git.project_paths())
         return HERDR.run_role(self.root, self.wt, self.role, self.slug, text, timeout_ms, self.agent)
 
     def finish(self) -> list[str]:
@@ -1892,7 +1930,7 @@ class Driver:
         left = sorted({p for _, p in Git(self.wt).porcelain()})
         if not left:
             return
-        judge, maker = ("reviewer", "implementer") if self.checker.approved() else ("spec_reviewer", "spec_author")
+        judge, maker = self.phase()
         own = {f"{self.files.rel}/{REVIEWS[judge].file}", f"{self.files.rel}/questions.md"}
         role = judge if set(left) <= own else maker
         self.log(f"committing what an unfinished {role} run left: {', '.join(left[:8])}")
@@ -1910,16 +1948,25 @@ class Driver:
         return text.strip()
 
     def at_blocked(self, text: str) -> tuple[str, str] | None:
-        """A question waits in questions.md: stop for the human, or clear it and hand their answer to the role the
-        state names next (the one whose work the question interrupted)."""
+        """A question waits in questions.md: stop for the human, or clear it and hand their answer to the role that
+        asked: the phase's maker when the question came with its run (its files may be complete, and the state would
+        name the reviewing role), else the role the state names next."""
         if not text:
             self.stop(
                 f"blocked, needs you: read {self.files.questions_md}; "
                 f'answer with `{CMD} drive {self.slug} "<answer>" --tab`'
             )
+        asker = self.files.asker()
         asked = self.files.answer()
-        self.msg = f"The human answered the questions in questions.md.\nQuestions:\n{asked}\nAnswer: {text}"
+        msg = f"The human answered the questions in questions.md.\nQuestions:\n{asked}\nAnswer: {text}"
+        if asker == self.phase()[1]:
+            return asker, self.with_conflicts(msg) if asker == "implementer" else msg
+        self.msg = msg
         return None
+
+    def phase(self) -> tuple[str, str]:
+        """(judge, maker): the roles of the phase the feature is in, the spec's until it is approved."""
+        return ("reviewer", "implementer") if self.checker.approved() else ("spec_reviewer", "spec_author")
 
     def at_approve_gate(self, text: str) -> tuple[str, str] | None:
         if text:  # feedback for the spec, whoever approves
@@ -1969,10 +2016,11 @@ class Driver:
         return role, text
 
     def wait_role(self, role: str, settled: bool, note: str, started: float) -> str:
-        """Wait until the role agent settles; returns its note. Past max_role_minutes since `started`, stop for the
+        """Wait until the role agent settles; returns its note. An agent seen working is not settled, whatever the
+        wait said: a run is never judged while its agent works. Past max_role_minutes since `started`, stop for the
         human instead (the agent is left running: whether to stop it is theirs to decide)."""
         name, limit = agent_name(role, self.slug, self.root), self.cfg.max_role_minutes
-        while not settled:
+        while not settled or HERDR.state(name) == "working":
             minutes = int((time.time() - started) // 60)
             if limit and minutes >= limit:
                 self.stop(
