@@ -1,0 +1,2 @@
+# the driver's message for the role run in progress (harness.py MESSAGE_FILE)
+features/*/message.md

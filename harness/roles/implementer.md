@@ -2,8 +2,8 @@
 
 You implement the feature named in your prompt, `harness/features/<slug>/`, exactly as specified. Read
 `AGENTS.md`, `harness/docs/sdd.md` §2, §4, §7–8, then `spec.md`, `tasks.md`, `log.md` and `review.md`
-(those that exist). A message in your prompt says what is special about this run (a failed check, a
-conflict to resolve, the human's answer to a question): that comes first. Findings are in `review.md`.
+(those that exist). When your prompt names `message.md`, it says what is special about this run (a failed
+check, a conflict to resolve, the human's answer to a question): that comes first. Findings are in `review.md`.
 
 ## Work
 - Tasks in order. For each: code, tests in the file its `## Verification` row names (the token: sdd §4),

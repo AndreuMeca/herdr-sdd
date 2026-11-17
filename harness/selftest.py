@@ -277,6 +277,9 @@ elif cmd == "agent wait":
         err("agent_not_found")
     if state.get("wait_error"):
         err(state["wait_error"])
+    if state.get("after_wait") and "--until" not in args:  # the turn ends while the launcher waits
+        agents[args[2]]["status"] = state["after_wait"]
+        save()
     until = [args[i + 1] for i, a in enumerate(args) if a == "--until"] or ["idle", "done", "blocked"]
     if agents[args[2]]["status"] not in until:  # like herdr: blocked is settled unless --until says otherwise
         err("timeout")
@@ -285,8 +288,8 @@ elif cmd == "agent read":
     print(state.get("screen", ""))
 elif cmd == "agent send-keys":
     a = agents.get(args[2])
-    if a and "enter" in args[3:]:  # the dialog was answered
-        a["status"] = "idle"
+    if a and "enter" in args[3:]:  # the dialog was answered, or a stalled prompt submitted
+        a["status"] = state.get("after_enter", "idle")
         save()
     ok({"type": "ok"})
 elif cmd == "tab create":
@@ -385,7 +388,7 @@ elif cmd == "read":
     print(state.get("screen", ""))
 elif cmd == "keys":
     t = find(args[1])
-    t["status"] = {"state": "idle"}
+    t["status"] = {"state": state.get("after_keys", "idle")}
     state["screen"] = ""
     save()
     ok({})
@@ -597,11 +600,12 @@ class PureFunctions(unittest.TestCase):
         )
         self.assertEqual(agent({"harness": "gemini", "effort": "high", "permissions": "full"}).cli_args(), [])
         self.assertEqual(
-            h.RoleRun.prompt_for("reviewer", "s", " a\n b ", "main"),
-            "Read harness/roles/reviewer.md and follow it for harness/features/s/ (base branch: main). a b",
+            h.RoleRun.prompt_for("reviewer", "s", True, "main"),
+            "Read harness/roles/reviewer.md and follow it for harness/features/s/ (base branch: main). This run's "
+            "message is in harness/features/s/message.md: read it first.",
         )
         self.assertEqual(
-            h.RoleRun.prompt_for("spec_author", "s", "", "dev", bootstrap=True),
+            h.RoleRun.prompt_for("spec_author", "s", False, "dev", bootstrap=True),
             "Read harness/roles/spec_author.md and follow it for harness/features/s/ (base branch: dev; no project "
             "code yet: this feature sets the project up).",
         )
@@ -1413,7 +1417,9 @@ class DriverTests(Case):
         self.stub("Driver", type("Driver", (h.Driver,), {"spawn_merge": lambda driver: self.fake_merge(driver)}))
 
     def fake_prompt(self, root, wt, role, slug, text, timeout_ms, acfg):
-        self.calls.append((role, text))
+        msg = h.FeatureFiles(wt, slug).dir / h.MESSAGE_FILE  # the message, as the role reads it
+        self.assertEqual(msg.exists(), msg.name in text, "the prompt names the message file when there is one")
+        self.calls.append((role, text + (" " + msg.read_text().strip() if msg.exists() else "")))
         self.actions[role].pop(0)()
         return True, ""
 
@@ -1947,6 +1953,48 @@ class DriverTests(Case):
         self.assertEqual(h.FeatureFiles(self.r.wt, "feat").questions(), [])
         self.assertEqual(self.merged, ["feat"])
 
+    def test_an_answer_goes_to_the_author_who_asked_with_a_complete_spec(self):
+        def asks():
+            self.spec_author()
+            self.r.questions("- Was there anything after decision 2?")
+
+        self.actions["spec_author"] = [asks, self.spec_author]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
+        code, _ = self.drive()
+        self.assertEqual((code, self.r.state()), (h.EXIT_DONE, "blocked"))
+        code, _ = self.drive(msg="yes: decision 3")
+        self.assertEqual(self.roles(), ["spec_author", "spec_author", "spec_reviewer"], "not to the reviewer first")
+        self.assertIn("Answer: yes: decision 3", self.calls[1][1])
+        self.assertEqual(self.r.state(), "spec_ready")
+
+    def test_a_long_message_reaches_the_role_through_a_file(self):
+        self.actions["spec_author"] = [self.spec_author]
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
+        msg = "Decision 1.\n" + "x" * 3000 + "\nthe last words"
+        self.drive(msg=msg)
+        typed = self.calls[0][1].split(" Decision 1.")[0]  # what goes into the agent's terminal
+        self.assertLess(len(typed.encode()), h.PROMPT_MAX, "a typed line must fit the terminal's line input")
+        self.assertNotIn("\n", typed)
+        self.assertIn("harness/features/feat/message.md: read it first.", typed)
+        self.assertTrue(self.calls[0][1].endswith(msg), "whole, line breaks included")
+        self.assertEqual(self.r.git("status", "--porcelain", cwd=self.r.wt), "", "git ignores the message file")
+        self.assertEqual(self.r.log()[-2:], ["feat: spec_author", "feat: spec_reviewer"], "and no run commits it")
+        with self.assertRaises(h.Die):
+            h.RoleRun.prompt_for("reviewer", "s", True, "b" * 1024)
+
+    def test_a_run_is_not_judged_while_its_agent_works(self):
+        """The prompt came back as settled (a stall, an Enter) but the agent works: the driver waits for it."""
+        states = iter(["working", "working"])
+        self.stub_herdr("state", lambda name: next(states, "idle"))
+        waits = []
+        self.stub_herdr("wait", lambda name, ms: (waits.append(name), self.spec_author(), (True, ""))[-1])
+        self.actions["spec_author"] = [lambda: None]  # nothing on disk yet when the prompt returns
+        self.actions["spec_reviewer"] = [self.spec_reviewer]
+        code, out = self.drive()
+        self.assertEqual(len(waits), 2, "once per look that found it working")
+        self.assertNotIn("changed nothing that counts", out)
+        self.assertEqual(self.r.state(), "spec_ready")
+
     def stuck_role(self, max_minutes, settle_after):
         """A spec author whose prompt never settles by itself; wait_agent settles after `settle_after` waits; each
         wait moves the clock 10 minutes."""
@@ -2435,13 +2483,6 @@ class HerdrAdapter(Case):
             (True, "agent_blocked"),
         )
         self.assertEqual(len(self.calls("agent", "start")), 2, "a fresh agent every run")
-        self.state["prompt_error"] = "agent_prompt_stalled"  # the text sits in the input box, the agent idle
-        self.save_state()
-        with contextlib.redirect_stdout(io.StringIO()):
-            out = h.HERDR.run_role(self.r.root, self.r.wt, "implementer", "feat", "x", 5, agent(self.ACFG))
-        self.assertEqual(out, (True, ""), "Enter once, then wait for the agent")
-        self.assertEqual(self.calls("agent", "send-keys")[-1], ["agent", "send-keys", self.impl, "enter"])
-        self.assertEqual(self.calls("agent", "wait")[-1][:3], ["agent", "wait", self.impl])
         self.assertEqual(h.HERDR.state(self.impl), "idle")
         self.assertEqual(h.HERDR.state("nobody"), "gone")
         self.assertEqual(h.HERDR.wait("nobody", 5), (True, "agent_not_found"))
@@ -2452,6 +2493,36 @@ class HerdrAdapter(Case):
         with self.assertRaises(h.Die) as cm:
             h.HERDR.call("agent", "get", "x")
         self.assertIn("herdr not found in PATH", cm.exception.msg)
+
+    def stalled(self, text: str, **state) -> tuple:
+        """A role run whose prompt sits unsubmitted in the input box, the agent idle."""
+        self.state.update(prompt_error="agent_prompt_stalled", agents={}, **state)
+        self.save_state()
+        self.log_path.write_text("")
+        self.stub_herdr("enter_s", 0.2)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return h.HERDR.run_role(self.r.root, self.r.wt, "implementer", "feat", text, 5, agent(self.ACFG))
+
+    PROMPT = "Read harness/roles/implementer.md and follow it for harness/features/feat/ (base branch: main)."
+
+    def test_a_stalled_prompt_gets_enter_and_the_run_is_followed(self):
+        box = "> Read harness/roles/implementer.md and follow it for\n  harness/features/feat/ (base branch: main)."
+        out = self.stalled(self.PROMPT, screen=box, after_enter="working", after_wait="idle")
+        self.assertEqual(out, (True, ""), "Enter once; the agent is seen working; then its turn is waited for")
+        self.assertEqual(self.calls("agent", "read")[0][3:5], ["--source", "visible"], "what is in the box now")
+        self.assertEqual(self.calls("agent", "send-keys"), [["agent", "send-keys", self.impl, "enter"]])
+        self.assertEqual(self.calls("agent", "wait")[-1][:3], ["agent", "wait", self.impl])
+
+    def test_an_enter_that_does_not_start_the_agent_is_not_a_finished_run(self):
+        out = self.stalled(self.PROMPT, screen="> " + self.PROMPT)  # the fake stays idle after the Enter
+        self.assertEqual(out, (True, "prompt stalled; Enter did not start the agent"))
+        self.assertEqual(len(self.calls("agent", "send-keys")), 1)
+        self.assertEqual(self.calls("agent", "wait"), [], "an idle agent would pass for a settled one")
+
+    def test_a_fragment_in_the_input_box_is_never_submitted(self):
+        out = self.stalled(self.PROMPT, screen="> " + self.PROMPT[:60])
+        self.assertEqual(out, (True, "prompt truncated in the input box"))
+        self.assertEqual(self.calls("agent", "send-keys"), [], "no Enter on part of a prompt")
 
     def test_launch_driver_uses_the_driver_tab(self):
         stamp = h.Lock.driver(self.r.wt).stamp
@@ -2791,10 +2862,19 @@ class HerdrAppAdapter(Case):
         self.assertEqual(self.role(), (True, "agent_blocked"))
 
     def test_a_prompt_that_did_not_start_gets_enter_once_when_idle(self):
-        self.state["send_result"] = {"started": False}
+        self.app.enter_s = 0.2
+        self.state.update(send_result={"started": False}, screen="> go", after_keys="working")
         self.save_state()
-        self.assertEqual(self.role(), (True, ""))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.role(), (True, ""), "seen working after the Enter, then waited for")
         self.assertEqual(self.calls("keys"), [["keys", self.name, "enter"]])
+        self.assertEqual(self.calls("wait")[-1][:2], ["wait", self.name])
+        self.state_set(terminals=[], screen="> go", after_keys="idle")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.role(), (True, "prompt stalled; Enter did not start the agent"))
+        self.state_set(terminals=[], screen="> g")
+        self.assertEqual(self.role(text="go on"), (True, "prompt truncated in the input box"))
+        self.assertEqual(len(self.calls("keys")), 2, "no Enter on part of a prompt")
 
     def test_state_and_wait(self):
         self.role()
