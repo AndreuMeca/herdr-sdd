@@ -474,13 +474,12 @@ class AgentConfig:
         return CLIS.get(self.harness)
 
     def cli_args(self) -> list:
-        """The CLI flags after `--`: model, effort, permissions (translated by its Cli; a CLI not in CLIS gets
-        neither, `doctor` says so), then `args` verbatim."""
+        """The CLI's flags: model, effort, permissions (translated by its Cli; a CLI not in CLIS gets neither,
+        `doctor` says so), then `args` verbatim. How they reach the CLI is the runtime's business."""
         cli = self.cli
         model = ["--model", self.model] if self.model else []
         flags = [*cli.effort_args(self.effort), *cli.permission_args(self.permissions)] if cli else []
-        flags = [*flags, *self.args]
-        return ["--", *model, *flags] if (model or flags) else []
+        return [*model, *flags, *self.args]
 
     def describe(self) -> list[str]:
         """How `doctor` shows its effort and permissions (our words, what they mean) and the flags the CLI gets."""
@@ -497,7 +496,7 @@ class AgentConfig:
         else:
             how = f"; {cli.guarded_by}" if perm == "guarded" and cli.guarded_by else ""
             p = f"permissions  {perm}: {PERMISSION_WORDS[perm]}{how}"
-        return [e, p, "flags        " + (" ".join(self.cli_args()[1:]) or "-")]
+        return [e, p, "flags        " + (" ".join(self.cli_args()) or "-")]
 
 
 @dataclass(frozen=True)
@@ -1221,10 +1220,11 @@ class Herdr:
     def start_agent(self, ws_id: str, wt: Path, role: str, name: str, agent: AgentConfig):
         """A new tab for the role, with the agent started in it."""
         pane_id = self.new_tab(ws_id, wt, role)
+        flags = agent.cli_args()
         try:
             self.call(
                 "agent", "start", name, "--kind", agent.harness, "--pane", pane_id, "--timeout", 120_000,
-                *agent.cli_args(),
+                *(["--", *flags] if flags else []),
             )  # fmt: skip
         except HerdrError as e:
             if e.code != "agent_not_ready":  # not ready: a startup dialog, which settle_startup answers

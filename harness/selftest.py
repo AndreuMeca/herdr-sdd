@@ -577,7 +577,7 @@ class PureFunctions(unittest.TestCase):
             ("codex", "full"): ["--dangerously-bypass-approvals-and-sandbox"],
         }
         for (kind, level), flags in cases.items():
-            self.assertEqual(agent({"harness": kind, "permissions": level}).cli_args(), ["--", *flags], (kind, level))
+            self.assertEqual(agent({"harness": kind, "permissions": level}).cli_args(), flags, (kind, level))
         self.assertNotIn(
             "--add-dir", h.CLIS["codex"].permissions["guarded"], "no write access to .git: the launcher commits"
         )
@@ -587,20 +587,19 @@ class PureFunctions(unittest.TestCase):
         self.assertTrue(h.valid_pattern("data/*.db"))
         for bad in ("/etc/passwd", "../x", "", ".", 3):
             self.assertFalse(h.valid_pattern(bad), bad)
-        self.assertEqual(agent({"harness": "gemini"}).cli_args(), [], "nothing to pass: no `--`")
+        self.assertEqual(agent({"harness": "gemini"}).cli_args(), [], "nothing to pass")
         self.assertEqual(
-            agent({"harness": "gemini", "model": "m", "args": ["-x"]}).cli_args(), ["--", "--model", "m", "-x"]
+            agent({"harness": "gemini", "model": "m", "args": ["-x"]}).cli_args(), ["--model", "m", "-x"]
         )
         self.assertEqual(
             agent({"harness": "claude", "effort": "extra"}).cli_args(),
-            ["--", "--effort", "xhigh", "--dangerously-skip-permissions"],
+            ["--effort", "xhigh", "--dangerously-skip-permissions"],
         )
         self.assertEqual(
             agent(
                 {"harness": "codex", "model": "g", "effort": "high", "permissions": "full", "args": ["-y"]}
             ).cli_args(),
             [
-                "--",
                 "--model",
                 "g",
                 "-c",
@@ -696,7 +695,7 @@ class ConfigTests(Case):
             self.assertIn(msg, cm.exception.msg, why)
         self.r.write_cfg(agents={**AGENTS, "reviewer": {"harness": "gemini", "args": ["--yolo"]}})
         gemini = h.Config.load(self.r.root).agent("reviewer")
-        self.assertEqual((gemini.permissions, gemini.cli_args()), ("", ["--", "--yolo"]), "not translated: optional")
+        self.assertEqual((gemini.permissions, gemini.cli_args()), ("", ["--yolo"]), "not translated: optional")
         self.r.write_cfg(
             agents={**AGENTS, "reviewer": {"harness": "gemini", "permissions": "full", "args": ["--yolo"]}}
         )
@@ -2982,8 +2981,9 @@ class HerdrAppAdapter(Case):
         self.assertEqual(self.role(), (True, ""))
         t = self.state_now()["terminals"][0]
         self.assertEqual(t["name"], self.name)
-        self.assertEqual(t["argv"][0], "claude")
-        self.assertIn("--dangerously-skip-permissions", t["argv"])
+        self.assertEqual(  # no `--` before the flags: the CLI would take them for its prompt
+            t["argv"], ["claude", "--model", "m", "--effort", "high", "--dangerously-skip-permissions"]
+        )
         self.assertIn(f"herdr.space={self.space}", t["labels"])
         run = self.calls("run")[0]
         for flag in ("--bg", "--no-parent", "--no-notify"):  # outlives the driver; nothing typed into the driver
