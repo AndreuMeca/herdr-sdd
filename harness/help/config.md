@@ -19,8 +19,9 @@ and the fix.
    no code yet keeps them: neither runs until the project has code, and the first feature sets the project up so
    that they pass.
 3. `copy_files`: the gitignored files a worktree needs, such as `.env`.
-4. `agents`: the CLI, model, effort and permissions of each role ("agents.<role>" below). `doctor --models`
-   checks each model id with one tiny prompt.
+4. `agents`: the CLI, model, effort and permissions of each role, and the `fallback` it switches to when that
+   provider's usage limit stops it ("agents.<role>" below). `doctor --models` checks each model id with one tiny
+   prompt.
 5. `gates`: leave both `human` until you trust the roles with your project ("Fully automatic" below).
 6. `update_harness`: leave it `true` to hear of the template's changes before a feature starts; `false` when you
    change the harness's own files on purpose ("Template updates" below).
@@ -84,6 +85,7 @@ CLI (tables below), and `doctor` prints one `flags` line per role with the exact
 | `effort` | no | `low`, `medium`, `high`, `extra`, `max`, or `""` | How hard the model thinks, by meaning, translated per CLI (table below). Empty = the CLI's default. |
 | `permissions` | for `claude`, `codex`, `pi` | `guarded`, `full` | What the agent may do without asking (table below). Roles run unattended, so there is no level that asks. For any other CLI leave it out and put the CLI's own flags in `args`. |
 | `args` | no | list of strings | Any other flag, verbatim; `doctor`'s `flags` line shows the result. |
+| `fallback` | no | an entry of its own: `harness`, `model`, `effort`, `permissions`, `args` | The agent that takes over when this one stops at its provider's usage limit ("When a provider runs out" below). The same keys and rules as the role's entry, nothing taken from it; it has no `fallback` of its own. The shipped file gives each Claude role a Codex fallback and each Codex role a Claude one, on the CLI's default model, with the role's effort and permissions. |
 
 **effort**, `low` < `medium` < `high` < `extra` < `max`, becomes:
 
@@ -129,7 +131,27 @@ Ready-to-copy entries:
 { "harness": "claude", "model": "claude-sonnet-5-5", "effort": "high",  "permissions": "full" }
 { "harness": "claude", "model": "claude-opus-5-5",   "effort": "extra", "permissions": "guarded" }
 { "harness": "codex",  "model": "",                  "effort": "extra", "permissions": "guarded" }
+{ "harness": "claude", "model": "claude-opus-5-5",   "effort": "extra", "permissions": "guarded",
+  "fallback": { "harness": "codex", "model": "", "effort": "extra", "permissions": "guarded" } }
 ```
+
+### When a provider runs out
+
+A role whose entry has a `fallback` goes on with it when its own provider's usage limit stops it:
+- What counts: one of the CLI's own limit messages (`limit_texts` in `CLIS`: Claude Code's "Usage limit reached",
+  "out of usage credits", a spend limit, a 429; Codex's "hit your usage limit", its 429) in the last 15 non-empty
+  lines of the agent's screen. The driver reads it every minute while the agent works, since Claude Code on a
+  subscription may wait for the reset by itself and still look busy, and once more when the run ends.
+- What happens: the run is judged as usual first, and a run that did its job is done whatever its screen says.
+  Otherwise the launcher commits what the agent wrote, closes its tab and starts the fallback in a fresh one,
+  with the same message and a note that the previous run stopped at its usage limit, so it continues from the
+  files. The switch does not count as a retry.
+- Every run starts with the role's own agent again: nothing is remembered, so once the limit resets the role is
+  back on its first provider. While it stays out, each run loses about a minute before the switch.
+- When there is no fallback, or the fallback is at its limit too, the driver stops for you and names the
+  provider(s).
+- A CLI without `limit_texts` (pi, any CLI not in `CLIS`) is never seen at a limit, so a fallback behind it is
+  never used; `doctor` notes it. A CLI release that changes its message needs one line in `limit_texts`.
 
 ## Fully automatic
 No gate stops for you: the driver approves the spec and merges by itself, and the roles never ask (a question

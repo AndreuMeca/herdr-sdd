@@ -154,7 +154,9 @@ launcher and rules with the main checkout's `config.json`; what `test_cmd` runs 
   prompts the pane it was started from (when an agent runs in it) with `harness: <slug> ...`. After an `auto`
   merge, `merge` itself prompts that pane with the outcome (merged at `<sha>`, or why it failed).
 - Every role run is a fresh agent session in the role's tab of the feature's workspace, started with
-  `config.json` as it is then; the previous one is closed first. Memory between runs is the feature's files
+  `config.json` as it is then; the previous one is closed first. A run that did not finish its job because its
+  provider's usage limit stopped it goes on, in the same step, on the role's `fallback` agent
+  (`harness/help/config.md`, "When a provider runs out"). Memory between runs is the feature's files
   and the driver's message. The launcher answers the startup dialogs its CLI is known to show (`CLIS` in
   `harness.py`) and logs each one; when the first prompt stalls with the agent idle it sends Enter once, only if
   the input box holds the prompt to its end, and the agent must then start working within 5 seconds;

@@ -19,25 +19,49 @@
       "harness": "claude",
       "model": "",
       "effort": "extra",
-      "permissions": "guarded"
+      "permissions": "guarded",
+      "fallback": {
+        "harness": "codex",
+        "model": "",
+        "effort": "extra",
+        "permissions": "guarded"
+      }
     },
     "spec_reviewer": {
       "harness": "codex",
       "model": "",
       "effort": "extra",
-      "permissions": "guarded"
+      "permissions": "guarded",
+      "fallback": {
+        "harness": "claude",
+        "model": "",
+        "effort": "extra",
+        "permissions": "guarded"
+      }
     },
     "implementer": {
       "harness": "claude",
       "model": "",
       "effort": "high",
-      "permissions": "guarded"
+      "permissions": "guarded",
+      "fallback": {
+        "harness": "codex",
+        "model": "",
+        "effort": "high",
+        "permissions": "guarded"
+      }
     },
     "reviewer": {
       "harness": "codex",
       "model": "",
       "effort": "extra",
-      "permissions": "guarded"
+      "permissions": "guarded",
+      "fallback": {
+        "harness": "claude",
+        "model": "",
+        "effort": "extra",
+        "permissions": "guarded"
+      }
     }
   }
 }

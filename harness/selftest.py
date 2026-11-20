@@ -426,6 +426,7 @@ class Case(unittest.TestCase):
         else:
             self.stub_herdr("call", no_herdr)
             self.stub_herdr("state", lambda name: "idle")
+            self.stub_herdr("screen", lambda name, lines=40, source="": "")
             self.stub_herdr("sidebar", lambda *a, **k: None)
             orig = h.Doctor.herdr_state
             h.Doctor.herdr_state = lambda doc: None  # no herdr server in tests
@@ -494,6 +495,17 @@ class Case(unittest.TestCase):
 
 # ----------------------------------------------------------------------------- pure functions
 class PureFunctions(unittest.TestCase):
+    def test_a_usage_limit_counts_only_at_the_bottom_of_the_screen(self):
+        claude, codex = h.CLIS["claude"], h.CLIS["codex"]
+        bottom = "⏺ Working\n  Usage limit reached · continuing automatically at 3pm · esc to cancel\n> \n\n\n"
+        self.assertEqual(claude.limit(bottom), "Usage limit reached", "blank lines below do not push it out")
+        self.assertIsNone(codex.limit(bottom), "another CLI's message is not this one's")
+        scrolled = "Usage limit reached\n" + "\n".join(f"line {i}" for i in range(h.LIMIT_LINES))
+        self.assertIsNone(claude.limit(scrolled), "what the agent printed earlier has scrolled up")
+        stop = "■ You've hit your usage limit. Upgrade to Plus to continue using Codex\n› "
+        self.assertEqual(codex.limit(stop), "hit your usage limit")
+        self.assertIsNone(h.CLIS["pi"].limit(bottom), "pi has no limit_texts")
+
     def test_section(self):
         text = "## A\n1\n## Requirements\n<!-- c -->\n- R1: SHALL x\n## B\n"
         self.assertEqual(h.Markdown.section(text, "a"), ["1"])
@@ -691,6 +703,33 @@ class ConfigTests(Case):
         self.assertEqual(
             h.Config.load(self.r.root).agent("reviewer").harness, "gemini", "an untranslated CLI: flags in args"
         )
+
+    def test_a_fallback_is_an_agent_entry_of_its_own(self):
+        own = {"harness": "codex", "model": "gpt-x", "effort": "high", "permissions": "guarded", "args": ["-x"]}
+        impl = {"harness": "claude", "effort": "max", "permissions": "full", "args": ["--y"], "fallback": own}
+        self.r.write_cfg(agents={**AGENTS, "implementer": impl})
+        cfg = h.Config.load(self.r.root)
+        fb = cfg.agent("implementer").fallback
+        self.assertEqual(
+            (fb.harness, fb.model, fb.effort, fb.permissions, fb.args), ("codex", "gpt-x", "high", "guarded", ("-x",))
+        )
+        self.assertEqual((fb.fallback, cfg.agent("reviewer").fallback), (None, None))
+        self.assertEqual(fb.label, "codex (gpt-x)")
+        self.assertEqual(cfg.agent("implementer").label, "claude (default model)")
+        guarded = {"harness": "codex", "permissions": "guarded"}
+        bad = {
+            "not an object": ("codex", "fallback.harness is required"),
+            "no harness": ({"model": "x"}, "fallback.harness is required"),
+            "nothing taken from the role": ({"harness": "codex"}, "fallback.permissions: it is required"),
+            "a provider word": ({**guarded, "effort": "xhigh"}, "fallback.effort must be one of"),
+            "a level the CLI lacks": ({"harness": "pi", "permissions": "guarded"}, "fallback.permissions 'guarded'"),
+            "nested": ({**guarded, "fallback": guarded}, "fallback cannot have a fallback of its own"),
+        }
+        for why, (raw, msg) in bad.items():
+            self.r.write_cfg(agents={**AGENTS, "implementer": {**impl, "fallback": raw}})
+            with self.assertRaises(h.Die) as cm:
+                h.Config.load(self.r.root)
+            self.assertIn(f"agents.implementer.{msg}", cm.exception.msg, why)
 
     def test_copy_ignored(self):
         root = self.r.root
@@ -1415,6 +1454,9 @@ class DriverTests(Case):
         self.stub_herdr("notify", lambda pane, text: self.notes.append(text))
         self.closed: list[str] = []
         self.stub_herdr("close_role_tab", lambda wt, role: self.closed.append(role))
+        self.used: list[str] = []  # the CLI of each run
+        self.on_screen = ""  # what the agent of the last run left on its screen
+        self.stub_herdr("screen", lambda name, lines=40, source="": self.on_screen)
         self.merged = []
         self.stub("Driver", type("Driver", (h.Driver,), {"spawn_merge": lambda driver: self.fake_merge(driver)}))
 
@@ -1422,6 +1464,8 @@ class DriverTests(Case):
         msg = h.FeatureFiles(wt, slug).dir / h.MESSAGE_FILE  # the message, as the role reads it
         self.assertEqual(msg.exists(), msg.name in text, "the prompt names the message file when there is one")
         self.calls.append((role, text + (" " + msg.read_text().strip() if msg.exists() else "")))
+        self.used.append(acfg.harness)
+        self.on_screen = ""
         self.actions[role].pop(0)()
         return True, ""
 
@@ -1526,6 +1570,90 @@ class DriverTests(Case):
         )
         self.assertEqual(self.closed, [], "its tab stays, for the human to read why")
         self.assertEqual(self.r.state(), "reviewed")
+
+    def with_fallback(self, fallback=True, **cfg):
+        impl = {"harness": "claude", "permissions": "full"}
+        if fallback:
+            impl["fallback"] = {"harness": "codex", "model": "gpt-x", "effort": "high", "permissions": "guarded"}
+        self.r.write_cfg(agents={**AGENTS, "implementer": impl}, **cfg)
+
+    def limit(self, text="  Usage limit reached · continuing automatically at 3pm · esc to cancel"):
+        """What an agent shows when its provider's usage limit stops it, at the bottom of its screen."""
+        self.on_screen = f"⏺ Working on T1\n{text}\n> \n"
+
+    def test_a_usage_limit_hands_the_run_to_the_fallback(self):
+        self.with_fallback(gates={"approve": "auto", "merge": "auto"})
+        self.r.approved()
+
+        def half_done():
+            m = self.r.wt / "src" / "m.py"
+            m.write_text(m.read_text() + "# half done\n")
+            self.limit()
+
+        self.actions["implementer"] = [half_done, self.implementer]
+        self.actions["reviewer"] = [self.reviewer]
+        code, out = self.drive(msg="keep f pure")
+        self.assertEqual(code, h.EXIT_DONE)
+        self.assertEqual(self.roles(), ["implementer", "implementer", "reviewer"])
+        self.assertEqual(self.used, ["claude", "codex", "claude"], "the fallback for this run only")
+        self.assertIn(
+            "implementer: claude (default model) stopped at its usage limit (usage limit: Usage limit reached); "
+            "running codex (gpt-x)",
+            out,
+        )
+        handed = self.calls[1][1]
+        self.assertIn("keep f pure", handed, "the same message")
+        self.assertIn("on claude (default model), stopped at its usage limit; what it wrote is committed", handed)
+        self.assertEqual(self.r.log().count("feat: implementer"), 2, "the cut-off run's work is committed first")
+        self.assertIn("# half done", (self.r.wt / "src" / "m.py").read_text())
+        self.assertEqual(self.merged, ["feat"])
+
+    def test_a_usage_limit_without_a_fallback_stops_for_the_human(self):
+        self.r.approved()
+        self.actions["implementer"] = [self.limit]
+        code, _ = self.drive()
+        self.assertEqual((code, self.used), (h.EXIT_ATTENTION, ["claude"]))
+        self.assertIn(
+            "implementer stopped at the usage limit of claude (default model) (usage limit: Usage limit reached); "
+            "agents.implementer.fallback names another provider to go on with",
+            self.notes[-1],
+        )
+
+    def test_a_fallback_at_its_limit_too_stops_naming_both(self):
+        self.with_fallback()
+        self.r.approved()
+        self.actions["implementer"] = [self.limit, lambda: self.limit("■ You've hit your usage limit. Upgrade to Plus")]
+        code, _ = self.drive()
+        self.assertEqual((code, self.used), (h.EXIT_ATTENTION, ["claude", "codex"]))
+        self.assertIn("usage limit of claude (default model) and codex (gpt-x) (usage limit: hit your", self.notes[-1])
+        self.assertNotIn("names another provider", self.notes[-1])
+
+    def test_a_run_that_did_its_job_is_done_whatever_its_screen_says(self):
+        self.with_fallback()
+        self.r.approved()
+        self.actions["implementer"] = [lambda: (self.implementer(), self.limit())]
+        self.actions["reviewer"] = [self.reviewer]
+        code, _ = self.drive()
+        self.assertEqual(code, h.EXIT_DONE)
+        self.assertEqual((self.roles(), self.used), (["implementer", "reviewer"], ["claude", "claude"]))
+
+    def test_a_working_agent_at_its_limit_is_not_waited_for(self):
+        self.with_fallback()
+        self.r.approved()
+        waits = []
+
+        def wait(name, ms):
+            waits.append(name)
+            self.on_screen = ""  # the loop must end even if the check failed
+            return True, ""
+
+        self.stub_herdr("state", lambda name: "working" if self.on_screen else "idle")  # Claude waiting for the reset
+        self.stub_herdr("wait", wait)
+        self.actions["implementer"] = [self.limit, self.implementer]
+        self.actions["reviewer"] = [self.reviewer]
+        self.drive()
+        self.assertEqual(waits, [], "the limit on its screen ends the wait before any")
+        self.assertEqual(self.used[:2], ["claude", "codex"])
 
     def test_config_is_reloaded_each_step(self):
         self.actions["spec_author"] = [lambda: (self.spec_author(), self.auto())]  # the human edits config.json
@@ -2105,6 +2233,26 @@ class Commands(Case):
         self.assertIn("copy_files         .env", out)
         self.assertIn("ok    worktree", out)
         self.assertIn("feat (spec)", out)
+
+    def test_doctor_shows_and_checks_each_fallback(self):
+        self.chdir(self.r.root)
+        codex = {"harness": "codex", "model": "gpt-x", "effort": "high", "permissions": "guarded"}
+        agents = {
+            **AGENTS,
+            "implementer": {"harness": "claude", "permissions": "full", "fallback": codex},
+            "reviewer": {"harness": "gemini", "permissions": "full", "fallback": {"harness": "no-such-cli"}},
+        }
+        self.r.write_cfg(agents=agents)
+        _, out = self.output(h.cmd_doctor, Namespace(no_tests=True, models=False))
+        self.assertIn("fallback     codex (gpt-x): when claude stops at its usage limit\n", out)
+        flags = "--model gpt-x -c model_reasoning_effort=high --sandbox workspace-write --ask-for-approval never"
+        self.assertIn(" " * 23 + f"flags        {flags}\n", out, "its own flags, under it")
+        self.assertIn(
+            "fallback     no-such-cli (default model): when gemini stops at its usage limit   <- not in PATH", out
+        )
+        self.assertIn("FAIL  reviewer: fallback 'no-such-cli' CLI in PATH", out)
+        self.assertIn("agents.reviewer.fallback.harness", out)
+        self.assertIn("reviewer: its fallback is never used: the launcher cannot tell when gemini is at its usage", out)
 
     def start(self, launch_driver):
         """`start newf` from the main checkout, herdr creating the worktree at tmp/wt-new. The tools doctor looks for
@@ -2757,7 +2905,12 @@ class DoctorChecks(Case):
             agents={
                 "spec_author": {"harness": "claude", "model": "", "effort": "extra", "permissions": "full"},
                 "spec_reviewer": {"harness": "claude", "model": "", "effort": "extra", "permissions": "full"},
-                "implementer": {"harness": "gemini", "model": "x/y", "permissions": "full"},
+                "implementer": {
+                    "harness": "gemini",
+                    "model": "x/y",
+                    "permissions": "full",
+                    "fallback": {"harness": "codex", "model": "bad", "permissions": "guarded"},
+                },
                 "reviewer": {"harness": "codex", "model": "bad", "permissions": "guarded"},
             }
         )
@@ -2767,6 +2920,8 @@ class DoctorChecks(Case):
         self.assertIn("FAIL  reviewer: codex answers with model bad", out)
         self.assertIn("unknown model", out)
         self.assertIn("a wrong id (agents.reviewer.model), not logged in, or no credits", out)
+        self.assertIn("FAIL  implementer fallback: codex answers with model bad", out)
+        self.assertIn("a wrong id (agents.implementer.fallback.model)", out)
         self.assertIn("implementer: gemini has no probe here, its model is not checked", doc.notes)
         probes = log.read_text().splitlines()
         self.assertEqual(len(probes), 2, "one probe per (CLI, model) pair")

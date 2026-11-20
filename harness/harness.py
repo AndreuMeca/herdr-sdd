@@ -81,7 +81,9 @@ EARS_RE = re.compile(r"^(?:(?:WHILE|WHEN|WHERE) .+?, )*(?:IF .+?, THEN )?THE \S.
 MARKER_RE = r"^(<{7} |>{7} )"  # a conflict marker line, as `git grep -E` sees it
 RULES = Path(__file__).resolve().parent / "docs" / "sdd.md"  # the rules; §5 and §6 list the review checkpoints
 EXIT_DONE, EXIT_ERROR, EXIT_ATTENTION = 0, 1, 2
-DRIVE_WAIT_MS = 300_000  # the driver waits for a role in slices of this length
+DRIVE_WAIT_MS = 60_000  # the driver waits for a role in slices of this length, reading its screen after each
+LIMIT_LINES = 15  # the last non-empty lines of an agent's screen, where its CLI shows its own state (Cli.limit)
+LIMIT_NOTE = "usage limit"  # how a run that stopped at its provider's usage limit is noted (agents.<role>.fallback)
 DEFAULT_ROLE_MINUTES = 180  # the driver stops for a human when one role run takes longer (max_role_minutes)
 PROMPT_MAX = 1024  # bytes: a terminal still in line mode keeps no more of a typed line (macOS MAX_CANON)
 PROMPT_TAIL = 40  # characters: the end of a prompt that must be on screen before a stalled one gets its Enter
@@ -130,6 +132,7 @@ class Cli:
     guarded_by: str = ""  # what limits the agent under `guarded`, for `doctor` to say
     probe: tuple = ()  # a one-shot command for `doctor --models`; "{model}" and "{prompt}" are filled in
     startup_dialogs: tuple = ()  # (screen text, keys) per first-run dialog the launcher answers
+    limit_texts: tuple = ()  # what the CLI shows when its provider refuses it for a usage limit (Cli.limit)
 
     def effort_args(self, level: str) -> list:
         """The flags for one of our effort levels; empty when unset (the CLI's default)."""
@@ -153,6 +156,12 @@ class Cli:
         """(text, keys) of the startup dialog on screen, or None when it is not one the launcher knows."""
         return next(((text, keys) for text, keys in self.startup_dialogs if text in screen_text), None)
 
+    def limit(self, screen_text: str) -> str | None:
+        """The usage-limit text on screen, or None. Only the last LIMIT_LINES non-empty lines count: the CLI shows
+        its own state there, while what the agent printed as it worked has scrolled up."""
+        tail = "\n".join([line for line in screen_text.splitlines() if line.strip()][-LIMIT_LINES:])
+        return next((text for text in self.limit_texts if text in tail), None)
+
 
 SAME_EFFORTS = {"low": "low", "medium": "medium", "high": "high"}
 CLIS = {
@@ -168,6 +177,14 @@ CLIS = {
         startup_dialogs=(  # both default to "No, exit"; the accepting option is the next one down
             ("trust this folder", ("down", "enter")),
             ("Bypass Permissions mode", ("down", "enter")),
+        ),
+        limit_texts=(  # from Claude Code 2.1.329; on a subscription it may wait for the reset, still `working`
+            "Usage limit reached",
+            "out of usage credits",
+            "spend limit reached",
+            "hit your monthly spend limit",
+            "Request rejected (429)",
+            "credit balance too low",
         ),
     ),
     "codex": Cli(
@@ -186,6 +203,7 @@ CLIS = {
                 ("down", "down", "enter"),
             ),  # 1. Update now (default)  2. Skip  3. Skip until next version
         ),
+        limit_texts=("hit your usage limit", "exceeded retry limit, last status: 429"),  # from codex-cli 0.164.0
     ),
     "pi": Cli(
         effort_flag=("--thinking", "{}"),
@@ -414,11 +432,12 @@ class AgentConfig:
     effort: str = ""
     permissions: str = ""
     args: tuple = ()
+    fallback: AgentConfig | None = None  # the agent that takes over a run stopped at this one's usage limit
 
     @classmethod
     def parse(cls, role: str, raw, where: str) -> AgentConfig:
         """The entry after checking it; dies naming the first problem. The flags `effort` and `permissions` translate
-        to are never written by hand in `args`."""
+        to are never written by hand in `args`. Its `fallback` is an entry of its own, checked the same way."""
         if not isinstance(raw, dict) or not isinstance(raw.get("harness"), str) or not raw["harness"]:
             die(f"{where}.harness is required: the agent CLI's name")
         name, effort, perm = raw["harness"], raw.get("effort", ""), raw.get("permissions", "")
@@ -438,7 +457,17 @@ class AgentConfig:
         args = raw.get("args") or []
         if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
             die(f"{where}.args must be a list of strings")
-        return cls(role, name, raw.get("model") or "", effort, perm, tuple(args))
+        fallback = raw.get("fallback")
+        if isinstance(fallback, dict) and "fallback" in fallback:
+            die(f"{where}.fallback cannot have a fallback of its own")
+        if fallback is not None:
+            fallback = cls.parse(role, fallback, f"{where}.fallback")
+        return cls(role, name, raw.get("model") or "", effort, perm, tuple(args), fallback)
+
+    @property
+    def label(self) -> str:
+        """The CLI and model, as the driver's log and stops name them."""
+        return f"{self.harness} ({self.model or 'default model'})"
 
     @property
     def cli(self) -> Cli | None:
@@ -1776,13 +1805,18 @@ class Outcome:
     agent_state: str
 
 
+def at_limit(out: Outcome) -> bool:
+    """The run did not do its job and its agent stopped at its provider's usage limit."""
+    return out.result != "DONE" and out.note.startswith(LIMIT_NOTE)
+
+
 class RoleRun:
     """One role agent's run on one feature in its worktree, for the driver: the prompt it gets, the commit of what
     it wrote (rule 1), and whether the feature's state afterwards means it is done."""
 
-    def __init__(self, cfg: Config, root: Path, wt: Path, role: str, slug: str):
+    def __init__(self, cfg: Config, root: Path, wt: Path, role: str, slug: str, agent: AgentConfig | None = None):
         self.cfg, self.root, self.wt, self.role, self.slug = cfg, root, Path(wt), role, slug
-        self.name, self.agent = agent_name(role, slug, root), cfg.agent(role)
+        self.name, self.agent = agent_name(role, slug, root), agent or cfg.agent(role)
         self.files, self.git = FeatureFiles(wt, slug), Git(wt)
         self.checker = Checker(wt, slug, cfg.base_branch)
         self.start_sha = ""
@@ -2033,12 +2067,19 @@ class Driver:
         Git(self.wt).set_ref(REVIEWS[role].ref.format(slug=self.slug))
         return role, text
 
-    def wait_role(self, role: str, settled: bool, note: str, started: float) -> str:
+    def wait_role(self, role: str, agent: AgentConfig, settled: bool, note: str, started: float) -> str:
         """Wait until the role agent settles; returns its note. An agent seen working is not settled, whatever the
-        wait said: a run is never judged while its agent works. Past max_role_minutes since `started`, stop for the
-        human instead (the agent is left running: whether to stop it is theirs to decide)."""
+        wait said: a run is never judged while its agent works. A usage limit on its screen ends the wait at once,
+        working or not (Claude Code may wait for the reset by itself): the note says so (LIMIT_NOTE). Past
+        max_role_minutes since `started`, stop for the human instead (the agent is left running: whether to stop it
+        is theirs to decide)."""
         name, limit = agent_name(role, self.slug, self.root), self.cfg.max_role_minutes
-        while not settled or HERDR.state(name) == "working":
+        while True:
+            hit = agent.cli.limit(HERDR.screen(name, source="visible")) if agent.cli and agent.cli.limit_texts else None
+            if hit:
+                return f"{LIMIT_NOTE}: {hit}"
+            if settled and HERDR.state(name) != "working":
+                return note
             minutes = int((time.time() - started) // 60)
             if limit and minutes >= limit:
                 self.stop(
@@ -2058,17 +2099,17 @@ class Driver:
                 f"{role} ran {FIX_TRIES} times in a row and the feature is still at '{st}'. Last message to it:\n{text}"
             )
             self.stop(f"blocked, needs you: {role} ran {FIX_TRIES} times in a row, still at '{st}'", EXIT_ATTENTION)
-        run = RoleRun(self.cfg, self.root, self.wt, role, self.slug)
-        run.start()
-        self.log(f"run {role}" + (f": {' '.join(text.split())[:120]}" if text else ""))
-        HERDR.sidebar(self.wt, state_text(self.checker.state(), self.gates, running=role))
-        started = time.time()
-        settled, note = run.send(text, DRIVE_WAIT_MS)
-        note = self.wait_role(role, settled, note, started)
-        out = run.outcome(note, run.finish())
-        self.log(f"{run.name}: state={out.agent_state} -> {out.result}" + (f" [{out.note}]" if out.note else ""))
-        if out.errors:
-            print("\n".join(out.errors))
+        agent = self.cfg.agent(role)
+        run, out = self.run_once(role, text, agent)
+        tried = [agent]
+        if at_limit(out) and agent.fallback:  # what the run wrote is committed: the fallback goes on from the files
+            self.log(f"{role}: {agent.label} stopped at its usage limit ({out.note}); running {agent.fallback.label}")
+            handover = (
+                f"The previous run of this role, on {agent.label}, stopped at its usage limit; what it wrote is "
+                "committed: continue from the files."
+            )
+            run, out = self.run_once(role, f"{text}\n{handover}".strip(), agent.fallback)
+            tried.append(agent.fallback)
         if out.result == "DONE":
             HERDR.close_role_tab(self.wt, role)  # the run is judged; a tab stays only when the human must look
             return
@@ -2079,7 +2120,27 @@ class Driver:
             self.msg = "check fails:\n" + "\n".join(out.errors) + "\nFix it."
             return
         where = "its agent is gone" if out.agent_state == "gone" else f"inspect: {HERDR.read_hint(run.name)}"
+        if at_limit(out):
+            on = " and ".join(a.label for a in tried)
+            hint = "" if agent.fallback else f"; agents.{role}.fallback names another provider to go on with"
+            line = f"needs you: {role} stopped at the usage limit of {on} ({out.note}){hint}; {where}"
+            self.stop(line, EXIT_ATTENTION)
         self.stop(f"needs you: {role} stopped ({out.note or 'see its screen'}); {where}", EXIT_ATTENTION)
+
+    def run_once(self, role: str, text: str, agent: AgentConfig) -> tuple[RoleRun, Outcome]:
+        """One run of the role on this agent: prompted, waited for, what it wrote committed, judged."""
+        run = RoleRun(self.cfg, self.root, self.wt, role, self.slug, agent)
+        run.start()
+        self.log(f"run {role}" + (f": {' '.join(text.split())[:120]}" if text else ""))
+        HERDR.sidebar(self.wt, state_text(self.checker.state(), self.gates, running=role))
+        started = time.time()
+        settled, note = run.send(text, DRIVE_WAIT_MS)
+        note = self.wait_role(role, agent, settled, note, started)
+        out = run.outcome(note, run.finish())
+        self.log(f"{run.name}: state={out.agent_state} -> {out.result}" + (f" [{out.note}]" if out.note else ""))
+        if out.errors:
+            print("\n".join(out.errors))
+        return run, out
 
     def spawn_merge(self):
         """`merge` removes this worktree, its workspace and this very pane: run it detached from the main checkout."""
@@ -2189,6 +2250,12 @@ class Doctor:
             print(f"  {role:<18} {kind:<7} {model}{missing}")
             for line in agent.describe():
                 print(f"  {'':<18} {line}")
+            fb = agent.fallback
+            if fb:
+                missing = "   <- not in PATH" if not shutil.which(fb.harness) else ""
+                print(f"  {'':<18} fallback     {fb.label}: when {kind} stops at its usage limit{missing}")
+                for line in fb.describe():
+                    print(f"  {'':<20} {line}")
         print("  effort: " + " < ".join(EFFORT_LEVELS) + "   permissions: " + ", ".join(PERMISSION_LEVELS))
         print("  orchestrator       the agent you started (not in this file): its model and permissions are its own")
         print("edit harness/config.json (keys: harness/help/config.md); the launcher validates it on every command")
@@ -2219,12 +2286,25 @@ class Doctor:
             Git(self.root).ref_exists(f"refs/heads/{cfg.base_branch}"), f"base branch '{cfg.base_branch}' exists"
         )
         for role in ROLES:
-            kind = cfg.agent(role).harness
+            agent = cfg.agent(role)
+            kind, fb = agent.harness, agent.fallback
             self.check(
                 shutil.which(kind) is not None,
                 f"{role}: '{kind}' CLI in PATH",
                 f"install it and log in, or change agents.{role}.harness",
             )
+            if not fb:
+                continue
+            self.check(
+                shutil.which(fb.harness) is not None,
+                f"{role}: fallback '{fb.harness}' CLI in PATH",
+                f"install it and log in, or change agents.{role}.fallback.harness",
+            )
+            if not (agent.cli and agent.cli.limit_texts):
+                self.notes.append(
+                    f"{role}: its fallback is never used: the launcher cannot tell when {kind} is at its usage limit "
+                    "(limit_texts in CLIS)"
+                )
         for pat in cfg.copy_files:
             if list(self.root.glob(pat)):
                 self.check(True, f"copy_files: {pat} is in the main checkout")
@@ -2279,17 +2359,21 @@ class Doctor:
         """`--models`: one tiny prompt per (CLI, model) pair, so a wrong model id fails here, not mid-feature."""
         seen: dict[tuple, bool] = {}
         for role in ROLES:
-            agent = cfg.agent(role)
-            kind, model, cli = agent.harness, agent.model, agent.cli
-            if not (cli and cli.probe):
-                self.notes.append(f"{role}: {kind} has no probe here, its model is not checked")
-                continue
-            if (kind, model) not in seen:
-                seen[(kind, model)], out = probe_model(cli, model, self.root, agent.effort)
-                if not seen[(kind, model)]:
-                    print("\n".join("      | " + line for line in out.splitlines()[-8:]))
-            fix = f"its output is above: a wrong id (agents.{role}.model), not logged in, or no credits for it"
-            self.check(seen[(kind, model)], f"{role}: {kind} answers with model {model or '(default model)'}", fix)
+            primary = cfg.agent(role)
+            for agent, key in ((primary, f"agents.{role}"), (primary.fallback, f"agents.{role}.fallback")):
+                if not agent:
+                    continue
+                who = role if agent is primary else f"{role} fallback"
+                kind, model, cli = agent.harness, agent.model, agent.cli
+                if not (cli and cli.probe):
+                    self.notes.append(f"{who}: {kind} has no probe here, its model is not checked")
+                    continue
+                if (kind, model) not in seen:
+                    seen[(kind, model)], out = probe_model(cli, model, self.root, agent.effort)
+                    if not seen[(kind, model)]:
+                        print("\n".join("      | " + line for line in out.splitlines()[-8:]))
+                fix = f"its output is above: a wrong id ({key}.model), not logged in, or no credits for it"
+                self.check(seen[(kind, model)], f"{who}: {kind} answers with model {model or '(default model)'}", fix)
 
     def git_leftovers(self, base: str):
         root = self.root
