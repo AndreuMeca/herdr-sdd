@@ -616,8 +616,8 @@ class ConfigTests(Case):
     def test_defaults_and_main_checkout(self):
         cfg = self.r.cfg()
         self.assertEqual(
-            (cfg.gates, cfg.max_review_rounds, cfg.setup_cmd, cfg.copy_files, cfg.update_harness),
-            ({"approve": "human", "merge": "human"}, 3, "", (".env",), False),
+            (cfg.gates, cfg.max_review_rounds, cfg.setup_cmd, cfg.copy_files, cfg.update_harness, cfg.focus),
+            ({"approve": "human", "merge": "human"}, 3, "", (".env",), False, False),
         )
         (self.r.wt / "harness" / "config.json").write_text(
             json.dumps({"base_branch": "main", "test_cmd": "false", "agents": AGENTS})
@@ -641,6 +641,8 @@ class ConfigTests(Case):
             {"base_branch": 5, "test_cmd": "true", "agents": AGENTS},
             {"base_branch": "main", "test_cmd": ["pytest"], "agents": AGENTS},
             {"base_branch": "main", "test_cmd": "true", "agents": AGENTS, "update_harness": "yes"},
+            {"base_branch": "main", "test_cmd": "true", "agents": AGENTS, "herdr": {"focus": "no"}},
+            {"base_branch": "main", "test_cmd": "true", "agents": AGENTS, "herdr": True},
         ]
         for raw in bad:
             (self.r.root / "harness" / "config.json").write_text(json.dumps(raw))
@@ -2583,6 +2585,20 @@ class HerdrAdapter(Case):
             ["--cwd", str(self.r.root), "--path", str(closed), "--no-focus"],
         )
 
+    def test_herdr_focus_takes_the_human_to_what_opens(self):
+        self.r.write_cfg(herdr={"focus": True})
+        h.HERDR.create_worktree(self.r.root, "newf", "main")
+        self.assertEqual(self.calls("worktree", "create")[0][-1], "--focus")
+        closed = self.r.tmp / "closed"
+        self.r.git("worktree", "add", "-q", "-b", "closed", str(closed))
+        h.HERDR.open_workspace(self.r.root, closed)
+        self.assertEqual(self.calls("worktree", "open")[0][-1], "--focus")
+        h.HERDR.new_tab("w1", self.r.wt, "driver")
+        self.assertEqual(self.calls("tab", "create")[0][-1], "--focus")
+        self.r.write_cfg(herdr={"focus": False})
+        h.HERDR.new_tab("w1", self.r.wt, "driver")
+        self.assertEqual(self.calls("tab", "create")[1][-1], "--no-focus", "read when the tab opens")
+
     def test_sidebar_notify_and_remove_worktree(self):
         h.HERDR.sidebar(self.r.wt, "spec ready · needs you: approve")
         self.assertEqual(
@@ -2984,6 +3000,20 @@ class HerdrAppAdapter(Case):
         self.role()
         self.assertEqual(len([ln for ln in self.lines() if "tab.rename" in ln]), 4)
 
+    def test_herdr_focus_shows_the_new_tab_in_the_window(self):
+        self.role()
+        self.assertFalse([ln for ln in self.lines() if ".select" in ln], "never moved unless asked")
+        self.r.write_cfg(herdr={"focus": True})
+        self.role()
+        tab = self.app.app_id("tb", self.space, "implementer")
+        self.assertEqual(
+            self.lines()[-2:],
+            [f"herdr-app do space.select --id {self.space}", f"herdr-app do tab.select --id {tab}"],
+        )
+        self.window(1)  # the window never took the terminal: nothing to select
+        self.role()
+        self.assertEqual(len([ln for ln in self.lines() if "tab.select" in ln]), 1)
+
     def test_doctor_names_the_runtime_and_asks_for_no_sidebar_config(self):
         _, out = self.output(h.Doctor(self.r.root, tests=False).run)
         self.assertIn("hc in PATH (runtime: herdr app)", out)
@@ -3095,6 +3125,7 @@ class TemplateUpdates(Case):
         self.assertFalse(self.r.cfg().update_harness, "left out: false")
         _, out = self.output(h.Doctor(self.r.root, tests=False).run)
         self.assertIn("  update_harness     no\n", out)
+        self.assertIn("  herdr.focus        no: they open unseen\n", out)
         self.assertNotIn("template's latest", out)
         self.r.write_cfg(update_harness=True)
         _, out = self.output(h.Doctor(self.r.root, tests=False).run)

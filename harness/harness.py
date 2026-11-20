@@ -485,6 +485,7 @@ class Config:
     gates: dict  # "approve" / "merge" -> "human" | "auto"
     agents: dict  # role -> AgentConfig
     update_harness: bool  # doctor (and so start) checks the harness against the template's latest (TEMPLATE_URL)
+    focus: bool  # herdr.focus: what the launcher opens in herdr is shown to the human (else it opens in the background)
 
     @classmethod
     def load(cls, root: Path) -> Config:
@@ -528,6 +529,7 @@ class Config:
             gates=gates,
             agents=agents,
             update_harness=raw.get("update_harness", False),
+            focus=(raw.get("herdr") or {}).get("focus", False),
         )
 
     @staticmethod
@@ -540,6 +542,9 @@ class Config:
             die(f'{p}: setup_cmd must be a shell command or ""')
         if not isinstance(raw.get("update_harness", False), bool):
             die(f"{p}: update_harness must be true or false")
+        herdr = raw.get("herdr") or {}
+        if not isinstance(herdr, dict) or not isinstance(herdr.get("focus", False), bool):
+            die(f'{p}: herdr must be an object: {{"focus": true|false}}')
 
     def agent(self, role: str) -> AgentConfig:
         return self.agents[role]
@@ -996,6 +1001,14 @@ class Herdr:
     def reopen_hint(self, root: Path, branch: str) -> str:
         return f"herdr worktree open --cwd {root} --branch {branch}"
 
+    def focus(self, path: Path) -> bool:
+        """config.json's `herdr.focus` (the main checkout's, as it is when the launcher opens a workspace or tab):
+        whether the human is taken there."""
+        return Config.load(path).focus
+
+    def focus_flag(self, path: Path) -> str:
+        return "--focus" if self.focus(path) else "--no-focus"
+
     def call(self, *args) -> dict:
         """Run a herdr CLI command; return its JSON `result`. Errors (JSON on stderr) raise HerdrError."""
         if not self.available():
@@ -1041,7 +1054,7 @@ class Herdr:
         """The herdr workspace id of this worktree; opens the workspace if it is closed."""
         return (
             self.workspace_of(wt)
-            or self.call("worktree", "open", *self.repo_source(root), "--path", wt, "--no-focus")["workspace"][
+            or self.call("worktree", "open", *self.repo_source(root), "--path", wt, self.focus_flag(root))["workspace"][
                 "workspace_id"
             ]
         )
@@ -1051,7 +1064,7 @@ class Herdr:
         source = self.repo_source(root)
         try:
             return self.call(
-                "worktree", "create", *source, "--branch", slug, "--base", base, "--label", slug, "--no-focus"
+                "worktree", "create", *source, "--branch", slug, "--base", base, "--label", slug, self.focus_flag(root)
             )
         except HerdrError as e:
             die(f"herdr worktree create -> {e.code}: {e.message}")
@@ -1073,7 +1086,7 @@ class Herdr:
 
     def new_tab(self, ws_id: str, wt: Path, label: str) -> str:
         """A new tab in the workspace, opened at the worktree; returns its root pane id."""
-        tab = self.call("tab", "create", "--workspace", ws_id, "--cwd", wt, "--label", label, "--no-focus")
+        tab = self.call("tab", "create", "--workspace", ws_id, "--cwd", wt, "--label", label, self.focus_flag(wt))
         try:
             pane = tab["root_pane"]["pane_id"]
         except (KeyError, TypeError):
@@ -1299,10 +1312,11 @@ class Herdr:
 class HerdrApp(Herdr):
     """The same contract on the Herdr desktop app, a separate program from the terminal app: herdr-core runs its
     terminals, `hc` drives them, and the window shows them. What needs no window goes through `hc`, so a driver runs
-    with the window closed and never takes the human's focus: a terminal labelled `herdr.space=<id>` and
-    `herdr.tab=<id>` shows up in that space and tab, whose ids the launcher derives itself; there is no other record of
-    a workspace. A tab is its terminal; the last one closing closes the space. `herdr-app do` only names things, and
-    only while a window is open. A worktree is plain git, where the app's own `worktree` mod puts them."""
+    with the window closed and takes the human's focus only when `herdr.focus` asks: a terminal labelled
+    `herdr.space=<id>` and `herdr.tab=<id>` shows up in that space and tab, whose ids the launcher derives itself; there
+    is no other record of a workspace. A tab is its terminal; the last one closing closes the space. `herdr-app do`
+    only names and shows things, and only while a window is open. A worktree is plain git, where the app's own
+    `worktree` mod puts them."""
 
     label = "herdr app"
     binary = "hc"
@@ -1421,9 +1435,13 @@ class HerdrApp(Herdr):
             *self.tab_labels(ws_id, tab), *(["--", *argv] if argv else []),
         )  # fmt: skip
         for _ in range(4):  # an open window adopts the terminal a moment later and refuses the name until then
-            if self.window("tab.rename", "--id", tab, "--name", label) != 1:
+            shown = self.window("tab.rename", "--id", tab, "--name", label)
+            if shown != 1:
                 break
             time.sleep(0.5)
+        if shown == 0 and self.focus(wt):  # `hc run` never shows a terminal: the window does, when asked
+            self.window("space.select", "--id", ws_id)
+            self.window("tab.select", "--id", tab)
         return res["address"]
 
     def tab_of(self, ws_id: str, label: str) -> str | None:
@@ -2162,6 +2180,8 @@ class Doctor:
         print(f"  gates              approve: {cfg.gates['approve']}   merge: {cfg.gates['merge']}")
         update = f"yes: compared with {TEMPLATE_URL} ({TEMPLATE_BRANCH})" if cfg.update_harness else "no"
         print(f"  update_harness     {update}")
+        focus = "yes: you are taken to each workspace and tab it opens" if cfg.focus else "no: they open unseen"
+        print(f"  herdr.focus        {focus}")
         for role in ROLES:
             agent = cfg.agent(role)
             kind, model = agent.harness, agent.model or "(default model)"
